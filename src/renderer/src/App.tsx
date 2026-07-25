@@ -320,24 +320,14 @@ export function App(): React.JSX.Element {
       const message = event.data;
       if (!message || message.source !== "html-studio-agent") return;
 
-      // Throttle `selection` updates — at 60Hz these explode re-renders
-      // and freeze the UI when the color picker is being dragged.
-      if (message.type === "selection") {
-        const now = performance.now();
-        if (now - selectionThrottleRef.current < 33) return;
-        selectionThrottleRef.current = now;
-        const next = message.selection;
-        const prev = lastSelectionRef.current;
-        // Shallow dedup: skip if the meaningful state didn't change
-        if (prev && prev.nodeId === next.nodeId &&
-            prev.count === next.count &&
-            prev.tagName === next.tagName &&
-            prev.text === next.text) {
-          return;
-        }
-        lastSelectionRef.current = next;
-        setSelection(next);
-      }
+      // Throttle `selection` updates — TEMPORARILY DISABLED to debug color freeze
+      // if (message.type === "selection") {
+      //   const now = performance.now();
+      //   if (now - selectionThrottleRef.current < 33) return;
+      //   selectionThrottleRef.current = now;
+      //   ...
+      // }
+      if (message.type === "selection") setSelection(message.selection);
       if (message.type === "command") commit(message.payload);
       if (message.type === "notice") setNotice(message.message);
       if (message.type === "editor-state") {
@@ -356,10 +346,10 @@ export function App(): React.JSX.Element {
         });
       }
       if (message.type === "layers") {
-        // Throttle: DOM changes can fire 30+ times/sec during complex edits
-        const now = performance.now();
-        if (now - layerThrottleRef.current < 50) return;
-        layerThrottleRef.current = now;
+        // Throttle disabled to debug color freeze
+        // const now = performance.now();
+        // if (now - layerThrottleRef.current < 50) return;
+        // layerThrottleRef.current = now;
         setLayers(message.layers);
       }
       if (message.type === "source-code") {
@@ -367,9 +357,10 @@ export function App(): React.JSX.Element {
       }
       if (message.type === "text-select-pos") {
         // Throttle: fires on every mouse move over text selection → 60 updates/sec
-        const now = performance.now();
-        if (now - toolbarThrottleRef.current < 50) return;
-        toolbarThrottleRef.current = now;
+        // TEMPORARILY DISABLED to debug first-click color picker freeze
+        // const now = performance.now();
+        // if (now - toolbarThrottleRef.current < 50) return;
+        // toolbarThrottleRef.current = now;
         setFloatToolbar(message.visible ? { x: message.x, y: message.y } : null);
       }
       if (message.type === "ready") {
