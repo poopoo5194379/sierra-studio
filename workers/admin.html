@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SierraStudio Admin</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #f5f7fa; color: #1a1a2e; }
+header { background: #1a1a2e; color: #fff; padding: 16px 24px; display: flex; align-items: center; gap: 12px; }
+header img { width: 32px; height: 32px; }
+h1 { font-size: 1.3rem; font-weight: 600; }
+nav { display: flex; gap: 0; background: #2a2e3a; padding: 0 24px; }
+nav button { padding: 12px 20px; background: none; border: none; color: #aab; cursor: pointer; font-size: 0.9rem; border-bottom: 2px solid transparent; }
+nav button.active { color: #4f7cff; border-bottom-color: #4f7cff; }
+main { max-width: 1100px; margin: 24px auto; padding: 0 24px; }
+.card { background: #fff; border-radius: 8px; padding: 20px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+.card h2 { font-size: 1rem; margin-bottom: 12px; color: #4f7cff; }
+table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid #eee; }
+th { font-weight: 600; color: #666; }
+.loading { text-align: center; padding: 40px; color: #999; }
+.error { color: #e74c3c; padding: 12px; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+.stat { background: #f0f4ff; border-radius: 8px; padding: 16px; text-align: center; }
+.stat .num { font-size: 1.8rem; font-weight: 700; color: #4f7cff; }
+.stat .label { font-size: 0.8rem; color: #888; margin-top: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <span style="font-size:1.5rem">☁️</span>
+  <h1>SierraStudio Admin</h1>
+</header>
+<nav>
+  <button class="active" onclick="showTab('dashboard', this)">仪表盘</button>
+  <button onclick="showTab('files', this)">文件</button>
+  <button onclick="showTab('crashes', this)">错误日志</button>
+  <button onclick="showTab('sessions', this)">设备</button>
+</nav>
+<main id="main"><div class="loading">Loading...</div></main>
+
+<script>
+const API = "";  // same origin (deployed alongside Worker)
+
+async function apiFetch(path) {
+  const r = await fetch(API + path);
+  return r.json();
+}
+
+async function loadDashboard() {
+  const [[,sCount], [,fCount], [,oCount], [,cCount]] = await Promise.all([
+    apiFetch("/api/admin/stats/sessions"),
+    apiFetch("/api/admin/stats/files"),
+    apiFetch("/api/admin/stats/operations"),
+    apiFetch("/api/admin/stats/crashes"),
+  ]);
+  document.getElementById("main").innerHTML = `
+    <div class="stats">
+      <div class="stat"><div class="num">${sCount}</div><div class="label">活跃设备</div></div>
+      <div class="stat"><div class="num">${fCount}</div><div class="label">上传文件</div></div>
+      <div class="stat"><div class="num">${oCount}</div><div class="label">编辑操作</div></div>
+      <div class="stat"><div class="num">${cCount}</div><div class="label">错误报告</div></div>
+    </div>
+    <div class="card"><h2>快速操作</h2>
+      <p style="color:#666;font-size:0.85rem">
+        • 用 wrangler CLI 管理：<code>wrangler d1 execute sierrastudio-db --command="SELECT * FROM crashes ORDER BY created_at DESC LIMIT 20"</code><br>
+        • R2 文件管理：<code>wrangler r2 object get sierrastudio-files/files/&lt;id&gt;/latest.html</code>
+      </p>
+    </div>`;
+}
+
+async function loadFiles() {
+  const files = await apiFetch("/api/admin/files?limit=50");
+  if (files.error) { document.getElementById("main").innerHTML = `<div class="error">${files.error}</div>`; return; }
+  document.getElementById("main").innerHTML = `
+    <div class="card"><h2>最近文件 (${files.length})</h2>
+    <table><thead><tr><th>ID</th><th>名称</th><th>版本</th><th>创建时间</th><th>操作</th></tr></thead><tbody>
+    ${files.map(f => `<tr>
+      <td title="${f.id}">${f.id.slice(0,8)}...</td>
+      <td>${esc(f.name)}</td>
+      <td>${f.revision}</td>
+      <td>${f.created_at?.slice(0,16) || ""}</td>
+      <td><a href="/api/files/${f.id}/html" target="_blank">查看HTML</a></td>
+    </tr>`).join("")}
+    </tbody></table></div>`;
+}
+
+async function loadCrashes() {
+  const crashes = await apiFetch("/api/admin/crashes?limit=50");
+  if (crashes.error) { document.getElementById("main").innerHTML = `<div class="error">${crashes.error}</div>`; return; }
+  document.getElementById("main").innerHTML = `
+    <div class="card"><h2>最近错误 (${crashes.length})</h2>
+    <table><thead><tr><th>时间</th><th>设备</th><th>版本</th><th>平台</th><th>错误信息</th></tr></thead><tbody>
+    ${crashes.map(c => `<tr>
+      <td>${c.created_at?.slice(0,16) || ""}</td>
+      <td title="${c.session_id}">${c.session_id.slice(0,8)}...</td>
+      <td>${esc(c.app_version)}</td>
+      <td>${esc(c.platform)}</td>
+      <td title="${esc(c.error_stack || "")}">${esc(c.error_message).slice(0,80)}</td>
+    </tr>`).join("")}
+    </tbody></table></div>`;
+}
+
+async function loadSessions() {
+  const sessions = await apiFetch("/api/admin/sessions?limit=50");
+  if (sessions.error) { document.getElementById("main").innerHTML = `<div class="error">${sessions.error}</div>`; return; }
+  document.getElementById("main").innerHTML = `
+    <div class="card"><h2>最近设备 (${sessions.length})</h2>
+    <table><thead><tr><th>ID</th><th>首次连接</th><th>最后活动</th></tr></thead><tbody>
+    ${sessions.map(s => `<tr>
+      <td title="${s.id}">${s.id.slice(0,8)}...</td>
+      <td>${s.created_at?.slice(0,16) || ""}</td>
+      <td>${s.last_seen_at?.slice(0,16) || ""}</td>
+    </tr>`).join("")}
+    </tbody></table></div>`;
+}
+
+function showTab(name, btn) {
+  document.querySelectorAll("nav button").forEach(b => b.classList.remove("active"));
+  btn.classList.add("active");
+  if (name === "dashboard") loadDashboard();
+  else if (name === "files") loadFiles();
+  else if (name === "crashes") loadCrashes();
+  else if (name === "sessions") loadSessions();
+}
+
+function esc(s) { return (s || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+
+loadDashboard();
+</script>
+</body>
+</html>

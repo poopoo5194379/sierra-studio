@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>SierraStudio PPT Fixture</title>
+    <style>
+      body {
+        margin: 0;
+        background: #f4f6fb;
+        color: #172033;
+        font-family: "Segoe UI", "PingFang SC", sans-serif;
+      }
+      .page {
+        width: 960px;
+        margin: 48px auto;
+        padding: 48px;
+        background: white;
+        border-radius: 20px;
+        box-shadow: 0 24px 60px #2a355222;
+      }
+      .page-inner { display: block; }
+      h1 { margin: 0 0 8px; font-size: 34px; }
+      .subtitle { color: #68708a; margin-bottom: 28px; }
+      .rank-list {
+        display: flex;
+        gap: 20px;
+      }
+      .rank-card {
+        flex: 1;
+        padding: 22px;
+        border: 1px solid #e4e9f5;
+        border-radius: 16px;
+        background: #fbfcff;
+      }
+      .rank-title {
+        font-size: 15px;
+        color: #3157d7;
+        margin-bottom: 10px;
+      }
+      .rank-title b { font-size: 18px; }
+      .rank-value { font-size: 30px; font-weight: 700; }
+      .rank-note { color: #8a91a8; font-size: 13px; margin-top: 8px; }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <div class="page-inner">
+        <h1>季度指标看板</h1>
+        <p class="subtitle">用于编辑器静态卡片交互回归的本地夹具。</p>
+        <div class="rank-list">
+          <div class="rank-card">
+            <div class="rank-title"><b>互动总量</b></div>
+            <div class="rank-value">181,710</div>
+            <div class="rank-note">环比 +12.4%</div>
+          </div>
+          <div class="rank-card">
+            <div class="rank-title"><b>声量份额</b></div>
+            <div class="rank-value">32.6%</div>
+            <div class="rank-note">环比 +1.8pt</div>
+          </div>
+          <div class="rank-card">
+            <div class="rank-title"><b>正面情绪</b></div>
+            <div class="rank-value">87.2%</div>
+            <div class="rank-note">环比 -0.6pt</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

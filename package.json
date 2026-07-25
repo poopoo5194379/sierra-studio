@@ -1,0 +1,70 @@
+{
+  "name": "sierra-studio",
+  "productName": "SierraStudio",
+  "version": "0.1.0",
+  "private": true,
+  "description": "SierraStudio - a local-first visual HTML editor and PDF export studio.",
+  "main": "./out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "npm run typecheck && electron-vite build",
+    "preview": "electron-vite preview",
+    "postinstall": "node scripts/ensure-electron-path.cjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm test && npm run build",
+    "postbuild": "node scripts/post-build.cjs",
+    "pack": "electron-vite build && electron-builder --win --x64 --config.electronDist=\"node_modules\\electron\\dist\" && npm run postbuild",
+    "pack:dir": "electron-vite build && electron-builder --win --x64 --dir --config.electronDist=\"node_modules\\electron\\dist\" && npm run postbuild"
+  },
+  "dependencies": {
+    "linkedom": "^0.18.12",
+    "pdf-lib": "^1.17.1",
+    "postcss": "^8.5.6",
+    "postcss-value-parser": "^4.2.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "zod": "^4.0.14",
+    "electron-updater": "^6.8.9",
+    "electron-log": "^5.4.4"
+  },
+  "devDependencies": {
+    "@types/node": "^24.1.0",
+    "@types/react": "^19.1.9",
+    "@types/react-dom": "^19.1.7",
+    "@swc/core": "^1.13.3",
+    "@vitejs/plugin-react": "^4.7.0",
+    "electron": "^37.2.5",
+    "electron-builder": "^26.15.3",
+    "electron-vite": "^5.0.0",
+    "playwright": "^1.54.1",
+    "typescript": "^5.8.3",
+    "vite": "^7.0.6",
+    "vitest": "^3.2.4"
+  },
+  "build": {
+    "appId": "com.sierrastudio.app",
+    "productName": "SierraStudio",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "out/**/*",
+      "!out/**/*.js.map",
+      "!out/**/*.ts"
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "build/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "shortcutName": "SierraStudio"
+    },
+    "asar": true
+  }
+}

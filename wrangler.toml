@@ -1,0 +1,15 @@
+# SierraStudio Cloud Backend — Cloudflare Workers + D1 + R2
+name = "sierrastudio"
+main = "workers/api.ts"
+compatibility_date = "2025-07-01"
+
+# D1 Database
+[[d1_databases]]
+binding = "DB"
+database_name = "sierrastudio-db"
+database_id = "54f9b9c2-4a81-418c-aa3b-af17eddfc670"
+
+# R2 Bucket
+[[r2_buckets]]
+binding = "STORAGE"
+bucket_name = "sierrastudio-files"
