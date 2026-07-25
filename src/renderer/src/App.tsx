@@ -50,7 +50,7 @@ export function App(): React.JSX.Element {
   >("loading");
   const [cloudFileId, setCloudFileId] = useState<string | null>(null);
   const [cloudSaveStatus, setCloudSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
-  const [updateStatus, setUpdateStatus] = useState<"checking" | "available" | "downloading" | "downloaded" | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<"checking" | "available" | "latest" | "downloading" | "downloaded" | null>(null);
   const [showCloudPanel, setShowCloudPanel] = useState(false);
   const [pdfOptions, setPdfOptions] = useState<PdfExportOptions>({
     mode: "smart",
@@ -593,7 +593,8 @@ export function App(): React.JSX.Element {
                   setUpdateStatus("available");
                   alert("发现新版本！请重新下载安装。");
                 } else {
-                  setUpdateStatus(null);
+                  setUpdateStatus("latest");
+                  setTimeout(() => setUpdateStatus(null), 2000);
                 }
               } catch {
                 setUpdateStatus(null);
@@ -603,7 +604,7 @@ export function App(): React.JSX.Element {
             title="检查更新"
             style={{ marginLeft: 8, opacity: updateStatus === "checking" ? 0.6 : 1 }}
           >
-            {updateStatus === "checking" ? "检查中..." : updateStatus === "available" ? "🔄 更新可用" : "更新"}
+            {updateStatus === "checking" ? "检查中..." : updateStatus === "available" ? "🔄 更新可用" : updateStatus === "latest" ? "已是最新" : "更新"}
           </button>
         </div>
       </header>
