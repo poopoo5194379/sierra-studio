@@ -585,8 +585,12 @@ export function App(): React.JSX.Element {
           <button
             onClick={async () => {
               const api = window.sierraStudio as any;
-              if (!api?.checkForUpdate) return;
               setUpdateStatus("checking");
+              if (!api?.checkForUpdate) {
+                setUpdateStatus("latest");
+                setTimeout(() => setUpdateStatus(null), 2000);
+                return;
+              }
               try {
                 const result = await api.checkForUpdate();
                 if (result?.updateAvailable) {
