@@ -594,11 +594,13 @@ export function App(): React.JSX.Element {
                   alert("发现新版本！请重新下载安装。");
                 } else {
                   setUpdateStatus("latest");
-                  setTimeout(() => setUpdateStatus(null), 2000);
                 }
               } catch {
-                setUpdateStatus(null);
+                setUpdateStatus("latest");
               }
+              setTimeout(() => {
+                setUpdateStatus((prev) => prev === "latest" ? null : prev);
+              }, 2000);
             }}
             disabled={updateStatus === "checking" || updateStatus === "downloading"}
             title="检查更新"
