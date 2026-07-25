@@ -1345,7 +1345,7 @@ export function App(): React.JSX.Element {
             >{label}</button>
           ))}
           <input type="color" title="文字颜色"
-            key={`ftc-${floatToolbar.x}`}
+            key="float-toolbar-color"
             onChange={(e) => postToEditor({ action: "text-style", property: "color", value: e.target.value })}
             style={{ width: 24, height: 24, border: "none", background: "transparent", cursor: "pointer" }}
           />
