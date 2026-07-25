@@ -311,8 +311,9 @@ export function App(): React.JSX.Element {
       projectId: project.projectId,
       documentId: project.documentId
     }, payload);
-    scheduleCloudSave(payload);
-  }, [coordinator, project, scheduleCloudSave]);
+    // scheduleCloudSave disabled to debug color freeze
+    // scheduleCloudSave(payload);
+  }, [coordinator, project]);
 
   useEffect(() => {
     const onMessage = (event: MessageEvent<EditorToHostMessage>) => {
