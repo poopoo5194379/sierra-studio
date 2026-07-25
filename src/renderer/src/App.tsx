@@ -66,10 +66,7 @@ export function App(): React.JSX.Element {
   const cloudDebounceRef = useRef<number | null>(null);
   const lastCommandRef = useRef<CommandPayload | null>(null);
   const cloudFileIdRef = useRef<string | null>(null);
-  const lastSelectionRef = useRef<SelectionSnapshot | null>(null);
-  const selectionThrottleRef = useRef<number>(0);
-  const layerThrottleRef = useRef<number>(0);
-  const toolbarThrottleRef = useRef<number>(0);
+  // Throttle refs removed during debugging
 
   useEffect(() => {
     if (!project) return;
@@ -214,16 +211,6 @@ export function App(): React.JSX.Element {
       ...message
     } satisfies HostToEditorMessage, "*");
   }, []);
-
-  // Memoized so LayerTree (React.memo-wrapped) doesn't re-render
-  const handleLayerSelect = useCallback((nodeId: string) => {
-    postToEditor({ action: "clear-selection" });
-    iframeRef.current?.contentWindow?.postMessage({
-      source: "html-studio-host",
-      action: "restore-editor-state",
-      state: { scrollX: window.scrollX, scrollY: window.scrollY, selectedNodeIds: [nodeId] }
-    } satisfies HostToEditorMessage, "*");
-  }, [postToEditor]);
 
   const coordinator = useMemo(() => new CommandCoordinator(
     () => revisionRef.current,
@@ -1132,7 +1119,14 @@ export function App(): React.JSX.Element {
             <LayerTree
               nodes={layers}
               selectedId={selection?.nodeId ?? null}
-              onSelect={handleLayerSelect}
+              onSelect={(nodeId) => {
+                postToEditor({ action: "clear-selection" });
+                iframeRef.current?.contentWindow?.postMessage({
+                  source: "html-studio-host",
+                  action: "restore-editor-state",
+                  state: { scrollX: window.scrollX, scrollY: window.scrollY, selectedNodeIds: [nodeId] }
+                } satisfies HostToEditorMessage, "*");
+              }}
             />
           )}
         </aside>

@@ -1,5 +1,4 @@
 import {
-  memo,
   useEffect,
   useRef,
   useState,
@@ -17,7 +16,7 @@ interface CanvasViewportProps {
   onReload: () => void;
 }
 
-export const CanvasViewport = memo(function CanvasViewport({
+export function CanvasViewport({
   documentUrl,
   projectId,
   reloadKey,
@@ -104,4 +103,4 @@ export const CanvasViewport = memo(function CanvasViewport({
       </div>
     </div>
   );
-});
+}

@@ -1,6 +1,5 @@
 // GrapesJS-inspired LayerTree: recursive tree component for the sidebar
 
-import { memo } from "react";
 import type { LayerNode } from "../../../editor-runtime/protocol";
 
 interface Props {
@@ -10,7 +9,7 @@ interface Props {
   depth?: number;
 }
 
-export const LayerTree = memo(function LayerTree({ nodes, onSelect, selectedId, depth = 0 }: Props) {
+export function LayerTree({ nodes, onSelect, selectedId, depth = 0 }: Props) {
   return (
     <ul className="layer-tree" style={{ paddingLeft: depth > 0 ? 12 : 0, margin: 0, listStyle: "none", fontSize: 11 }}>
       {nodes.map((node) => (
@@ -35,4 +34,4 @@ export const LayerTree = memo(function LayerTree({ nodes, onSelect, selectedId, 
       ))}
     </ul>
   );
-});
+}
