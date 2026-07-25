@@ -65,6 +65,14 @@
       "createDesktopShortcut": true,
       "shortcutName": "SierraStudio"
     },
-    "asar": true
+    "asar": true,
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "poopoo5194379",
+        "repo": "sierra-studio",
+        "releaseType": "release"
+      }
+    ]
   }
 }

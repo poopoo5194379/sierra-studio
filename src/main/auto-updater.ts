@@ -10,10 +10,11 @@ import { app, BrowserWindow } from "electron";
 import { autoUpdater } from "electron-updater";
 import * as log from "electron-log";
 
-const UPDATE_REPO = process.env.SIERRASTUDIO_UPDATE_REPO || "";
+// Default to the project's GitHub repo. Override via env if you fork.
+const UPDATE_REPO = process.env.SIERRASTUDIO_UPDATE_REPO || "poopoo5194379/sierra-studio";
 
 export function setupAutoUpdater(): void {
-  if (!app.isPackaged || !UPDATE_REPO) return;
+  if (!app.isPackaged) return;
 
   log.transports.file.level = "info";
   autoUpdater.logger = log;

@@ -244,8 +244,8 @@ app.whenReady().then(() => {
 
   // ── Auto-update IPC ──
   ipcMain.handle(IPC_CHANNELS.checkForUpdate, async () => {
-    const repo = process.env.SIERRASTUDIO_UPDATE_REPO || "";
-    if (!repo) return { updateAvailable: false, reason: "no-repo" };
+    // Allow override via env; default to the project's GitHub repo
+    const repo = process.env.SIERRASTUDIO_UPDATE_REPO || "poopoo5194379/sierra-studio";
 
     const { autoUpdater } = await import("electron-updater");
     const [owner, repoName] = repo.split("/");

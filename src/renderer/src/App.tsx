@@ -589,11 +589,9 @@ export function App(): React.JSX.Element {
               setUpdateStatus("checking");
               try {
                 const result = await api.checkForUpdate();
-                if (result?.reason === "no-repo") {
-                  alert("尚未配置更新仓库。设置环境变量 SIERRASTUDIO_UPDATE_REPO=用户名/仓库名 后即可启用。");
-                  setUpdateStatus(null);
-                } else if (result?.updateAvailable) {
+                if (result?.updateAvailable) {
                   setUpdateStatus("available");
+                  alert("发现新版本！请重新下载安装。");
                 } else {
                   setUpdateStatus(null);
                 }
