@@ -25,6 +25,19 @@ export interface CloudFile {
   revision: number;
 }
 
+function readSessionId(value: unknown): string {
+  if (
+    !value
+    || typeof value !== "object"
+    || !("sessionId" in value)
+    || typeof value.sessionId !== "string"
+    || value.sessionId.length === 0
+  ) {
+    throw new Error("Session response is invalid");
+  }
+  return value.sessionId;
+}
+
 class CloudClient {
   private baseUrl: string;
   private sessionId: string | null = null;
@@ -46,10 +59,10 @@ class CloudClient {
     if (this.sessionId) return this.sessionId;
     const res = await fetchWithTimeout(`${this.baseUrl}/api/session`, { method: "POST" });
     if (!res.ok) throw new Error(`Session create failed: ${res.status}`);
-    const data = await res.json();
-    this.sessionId = data.sessionId;
-    try { localStorage.setItem("hs-cloud-session", this.sessionId); } catch { /* */ }
-    return this.sessionId;
+    const sessionId = readSessionId(await res.json());
+    this.sessionId = sessionId;
+    try { localStorage.setItem("hs-cloud-session", sessionId); } catch { /* */ }
+    return sessionId;
   }
 
   // ── Upload new file ──
@@ -67,7 +80,10 @@ class CloudClient {
   // ── Get latest HTML ──
 
   async getHtml(fileId: string): Promise<string> {
-    const res = await fetchWithTimeout(`${this.baseUrl}/api/files/${fileId}/html`);
+    const res = await fetchWithTimeout(
+      `${this.baseUrl}/api/files/${fileId}/html`,
+      { headers: { "X-Session-Id": await this.ensureSession() } }
+    );
     if (!res.ok) throw new Error(`Get HTML failed: ${res.status}`);
     return res.text();
   }
@@ -123,7 +139,7 @@ class CloudClient {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          sessionId: this.sessionId || "unknown", ...info
+          sessionId: await this.ensureSession(), ...info
         })
       });
     } catch { /* fire-and-forget */ }
