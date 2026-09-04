@@ -22,7 +22,7 @@ const { _electron: electron } = require("playwright");
   try {
     await application.evaluate(async ({ BrowserWindow }, selectedPath) => {
       const captureWindow = new BrowserWindow({
-        width: 1440,
+        width: 1600,
         height: 900,
         show: true,
         webPreferences: {
@@ -39,6 +39,21 @@ const { _electron: electron } = require("playwright");
     const errors = [];
     page.on("pageerror", (error) => errors.push(error.message));
     await page.waitForTimeout(1500);
+    const requestedSlide = Number(process.argv[4]);
+    if (Number.isInteger(requestedSlide) && requestedSlide > 0) {
+      const slide = page.locator(".slide").nth(requestedSlide - 1);
+      await slide.scrollIntoViewIfNeeded();
+      await slide.screenshot({
+        path: path.resolve(outputPath),
+        animations: "disabled"
+      });
+      console.log(JSON.stringify({
+        outputPath: path.resolve(outputPath),
+        slide: requestedSlide,
+        errors
+      }, null, 2));
+      return;
+    }
     if (process.argv[4] === "print") {
       await page.emulateMedia({ media: "print" });
       await page.waitForTimeout(500);
