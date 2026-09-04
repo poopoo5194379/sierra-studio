@@ -21,6 +21,10 @@ import {
   type AssetRecord,
   type StoredCheckpoint
 } from "../../infrastructure/sqlite/project-database";
+import {
+  parseProjectFeatures,
+  type ProjectFeatures
+} from "../../shared/project-features";
 
 const compress = promisify(brotliCompress);
 const decompress = promisify(brotliDecompress);
@@ -289,6 +293,18 @@ export class ProjectSession {
 
   addAsset(asset: AssetRecord): void {
     this.database.addAssets([asset]);
+  }
+
+  getProjectFeatures(): ProjectFeatures {
+    return parseProjectFeatures(
+      this.database.getProjectSetting("project_features")
+    );
+  }
+
+  setProjectFeatures(features: ProjectFeatures): ProjectFeatures {
+    const parsed = parseProjectFeatures(features);
+    this.database.setProjectSetting("project_features", parsed);
+    return parsed;
   }
 
   close(): void {
