@@ -21,7 +21,7 @@ if (!fs.existsSync(path.join(UNPACKED, "SierraStudio.exe"))) {
 const thin = {
   name: "sierra-studio",
   productName: "SierraStudio",
-  version: "0.1.0",
+  version: "0.3.5",
   main: "./resources/app.asar"
 };
 
