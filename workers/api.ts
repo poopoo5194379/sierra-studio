@@ -15,6 +15,10 @@
 interface Env {
   DB: D1Database;
   STORAGE: R2Bucket;
+  /** Comma-separated browser origins. Native requests without Origin are allowed. */
+  ALLOWED_ORIGINS?: string;
+  /** When unset, every /admin and /api/admin route is disabled. */
+  ADMIN_TOKEN?: string;
 }
 
 function uuid(): string {
@@ -40,12 +44,55 @@ function textResponse(body: string, contentType = "text/html"): Response {
   });
 }
 
+function requestSessionId(request: Request, bodySessionId?: unknown): string {
+  if (typeof bodySessionId === "string" && bodySessionId.length > 0) {
+    return bodySessionId;
+  }
+  return request.headers.get("X-Session-Id") ?? "";
+}
+
+async function sessionExists(env: Env, sessionId: string): Promise<boolean> {
+  if (!sessionId) return false;
+  const row = await env.DB.prepare("SELECT id FROM sessions WHERE id = ?")
+    .bind(sessionId)
+    .first<{ id: string }>();
+  return Boolean(row);
+}
+
+function isAllowedOrigin(request: Request, env: Env): boolean {
+  const origin = request.headers.get("Origin");
+  if (!origin) return true;
+  const allowed = new Set((env.ALLOWED_ORIGINS ?? "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean));
+  return allowed.has(origin);
+}
+
+function isAdminAuthorized(request: Request, env: Env): boolean {
+  if (!env.ADMIN_TOKEN) return false;
+  const authorization = request.headers.get("Authorization") ?? "";
+  if (authorization === `Bearer ${env.ADMIN_TOKEN}`) return true;
+  if (!authorization.startsWith("Basic ")) return false;
+  try {
+    const decoded = atob(authorization.slice("Basic ".length));
+    const separator = decoded.indexOf(":");
+    return separator >= 0 && decoded.slice(separator + 1) === env.ADMIN_TOKEN;
+  } catch {
+    return false;
+  }
+}
+
 // === Router ===
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
+
+    if (!isAllowedOrigin(request, env)) {
+      return json({ error: "origin not allowed" }, 403);
+    }
 
     // CORS preflight
     if (request.method === "OPTIONS") {
@@ -75,6 +122,12 @@ export default {
         const sessionId = form.get("sessionId") as string || "";
 
         if (!html) return json({ error: "html is required" }, 400);
+        if (html.length > 10_000_000) {
+          return json({ error: "html exceeds 10 MB limit" }, 413);
+        }
+        if (!await sessionExists(env, sessionId)) {
+          return json({ error: "invalid session" }, 401);
+        }
 
         const fileId = uuid();
         // Store initial version
@@ -94,12 +147,16 @@ export default {
       if (saveMatch && request.method === "POST") {
         const fileId = saveMatch[1];
         const { html, command, sessionId: sid } = await request.json() as any;
-        const sessionId = sid || request.headers.get("X-Session-Id") || "";
+        const sessionId = requestSessionId(request, sid);
 
         if (!html) return json({ error: "html is required" }, 400);
+        if (html.length > 10_000_000) {
+          return json({ error: "html exceeds 10 MB limit" }, 413);
+        }
 
-        const file = await env.DB.prepare("SELECT revision FROM files WHERE id = ?")
-          .bind(fileId).first<{ revision: number }>();
+        const file = await env.DB.prepare(
+          "SELECT revision FROM files WHERE id = ? AND session_id = ?"
+        ).bind(fileId, sessionId).first<{ revision: number }>();
         if (!file) return json({ error: "file not found" }, 404);
 
         const newRev = file.revision + 1;
@@ -128,6 +185,11 @@ export default {
       const htmlMatch = path.match(/^\/api\/files\/([^\/]+)\/html$/);
       if (htmlMatch && request.method === "GET") {
         const fileId = htmlMatch[1];
+        const sessionId = requestSessionId(request);
+        const owned = await env.DB.prepare(
+          "SELECT id FROM files WHERE id = ? AND session_id = ?"
+        ).bind(fileId, sessionId).first<{ id: string }>();
+        if (!owned) return json({ error: "file not found" }, 404);
         const obj = await env.STORAGE.get(`files/${fileId}/latest.html`);
         if (!obj) return json({ error: "file not found" }, 404);
         return textResponse(await obj.text());
@@ -138,6 +200,11 @@ export default {
       if (revMatch && request.method === "GET") {
         const fileId = revMatch[1];
         const rev = revMatch[2];
+        const sessionId = requestSessionId(request);
+        const owned = await env.DB.prepare(
+          "SELECT id FROM files WHERE id = ? AND session_id = ?"
+        ).bind(fileId, sessionId).first<{ id: string }>();
+        if (!owned) return json({ error: "file not found" }, 404);
         const obj = await env.STORAGE.get(`files/${fileId}/v${rev}.html`);
         if (!obj) return json({ error: "revision not found" }, 404);
         return textResponse(await obj.text());
@@ -147,9 +214,12 @@ export default {
       const undoMatch = path.match(/^\/api\/files\/([^\/]+)\/undo$/);
       if (undoMatch && request.method === "POST") {
         const fileId = undoMatch[1];
+        const body = await request.json() as Record<string, unknown>;
+        const sessionId = requestSessionId(request, body.sessionId);
 
-        const file = await env.DB.prepare("SELECT revision FROM files WHERE id = ?")
-          .bind(fileId).first<{ revision: number }>();
+        const file = await env.DB.prepare(
+          "SELECT revision FROM files WHERE id = ? AND session_id = ?"
+        ).bind(fileId, sessionId).first<{ revision: number }>();
         if (!file || file.revision === 0) return json({ revision: 0 });
 
         const prevRev = file.revision - 1;
@@ -182,9 +252,12 @@ export default {
       const redoMatch = path.match(/^\/api\/files\/([^\/]+)\/redo$/);
       if (redoMatch && request.method === "POST") {
         const fileId = redoMatch[1];
+        const body = await request.json() as Record<string, unknown>;
+        const sessionId = requestSessionId(request, body.sessionId);
 
-        const file = await env.DB.prepare("SELECT revision FROM files WHERE id = ?")
-          .bind(fileId).first<{ revision: number }>();
+        const file = await env.DB.prepare(
+          "SELECT revision FROM files WHERE id = ? AND session_id = ?"
+        ).bind(fileId, sessionId).first<{ revision: number }>();
         if (!file) return json({ revision: 0 });
 
         const maxRev = await env.DB.prepare(
@@ -222,14 +295,26 @@ export default {
       const statsMatch = path.match(/^\/api\/files\/([^\/]+)\/stats$/);
       if (statsMatch && request.method === "GET") {
         const fileId = statsMatch[1];
+        const sessionId = requestSessionId(request);
         const file = await env.DB.prepare(
-          "SELECT id, name, revision, created_at, updated_at FROM files WHERE id = ?"
-        ).bind(fileId).first();
+          `SELECT id, name, revision, created_at, updated_at
+           FROM files WHERE id = ? AND session_id = ?`
+        ).bind(fileId, sessionId).first();
         if (!file) return json({ error: "file not found" }, 404);
         return json(file);
       }
 
       // ── Admin Dashboard ──
+      if (
+        (path === "/admin" || path.startsWith("/api/admin/"))
+        && !isAdminAuthorized(request, env)
+      ) {
+        if (!env.ADMIN_TOKEN) return json({ error: "not found" }, 404);
+        return new Response("Authentication required", {
+          status: 401,
+          headers: { "WWW-Authenticate": 'Basic realm="SierraStudio Admin"' }
+        });
+      }
       if (path === "/admin" && request.method === "GET") {
         return new Response(adminHtml(), {
           headers: { "Content-Type": "text/html; charset=utf-8", "Access-Control-Allow-Origin": "*" }
@@ -266,17 +351,21 @@ export default {
       // ── Crash ──
       if (path === "/api/crash" && request.method === "POST") {
         const body = await request.json() as any;
+        const sessionId = requestSessionId(request, body.sessionId);
+        if (!await sessionExists(env, sessionId)) {
+          return json({ error: "invalid session" }, 401);
+        }
         const crashId = uuid();
         await env.DB.prepare(
           `INSERT INTO crashes (id, session_id, app_version, platform, error_message, error_stack)
            VALUES (?, ?, ?, ?, ?, ?)`
         ).bind(
           crashId,
-          body.sessionId || "",
-          body.appVersion || "",
-          body.platform || "",
-          body.errorMessage || body.message || "Unknown error",
-          body.errorStack || body.stack || null
+          sessionId,
+          String(body.appVersion || "").slice(0, 64),
+          String(body.platform || "").slice(0, 64),
+          String(body.errorMessage || body.message || "Unknown error").slice(0, 2_000),
+          String(body.errorStack || body.stack || "").slice(0, 20_000) || null
         ).run();
         return json({ crashId });
       }
