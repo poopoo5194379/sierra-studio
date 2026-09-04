@@ -1,5 +1,5 @@
 import type { CommandPayload } from "../domain/commands/schema";
-import { idOf, signatureOf } from "./dom";
+import { idOf, persistedIdOf, signatureOf } from "./dom";
 
 export interface FlowDrag {
   mode: "flow";
@@ -28,7 +28,12 @@ export function beginFlowDrag(
     pointerEvents: element.style.pointerEvents,
     opacity: element.style.opacity
   };
-  element.setPointerCapture(pointerId);
+  try {
+    element.setPointerCapture(pointerId);
+  } catch {
+    // Mouse-driven or synthetic drags do not always have an active Pointer
+    // Event ID. Document-level move/up listeners still keep the drag stable.
+  }
   element.style.pointerEvents = "none";
   element.style.opacity = "0.45";
   return state;
@@ -80,7 +85,7 @@ export function finishFlowDrag(state: FlowDrag): CommandPayload | null {
   return {
     type: "node.move",
     nodeId: idOf(state.element),
-    parentId: idOf(state.parent),
+    parentId: persistedIdOf(state.parent),
     beforeIndex: state.beforeIndex,
     afterIndex
   };
