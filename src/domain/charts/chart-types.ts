@@ -5,6 +5,7 @@ export const ChartDataSchema = z.object({
   series: z.array(z.object({
     name: z.string().optional(),
     type: z.string().optional(),
+    color: z.string().optional(),
     data: z.array(z.unknown())
   }))
 });
