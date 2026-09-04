@@ -86,18 +86,23 @@ class ChartJsHandle implements ChartHandle {
   }
 
   apply(patch: ChartPatch): void {
-    const plugins = record(this.instance.options.plugins);
-    this.instance.options.plugins = plugins;
-    if (patch.title !== undefined) {
-      const title = record(plugins.title);
-      title.display = patch.title.length > 0;
-      title.text = patch.title;
-      plugins.title = title;
-    }
-    if (patch.legendVisible !== undefined) {
-      const legend = record(plugins.legend);
-      legend.display = patch.legendVisible;
-      plugins.legend = legend;
+    if (patch.title !== undefined || patch.legendVisible !== undefined) {
+      const currentPlugins = this.instance.options.plugins;
+      const plugins = record(currentPlugins);
+      if (plugins !== currentPlugins) this.instance.options.plugins = plugins;
+      if (patch.title !== undefined) {
+        const currentTitle = plugins.title;
+        const title = record(currentTitle);
+        title.display = patch.title.length > 0;
+        title.text = patch.title;
+        if (title !== currentTitle) plugins.title = title;
+      }
+      if (patch.legendVisible !== undefined) {
+        const currentLegend = plugins.legend;
+        const legend = record(currentLegend);
+        legend.display = patch.legendVisible;
+        if (legend !== currentLegend) plugins.legend = legend;
+      }
     }
     if (patch.primaryColor !== undefined) {
       const datasets = this.instance.config.data?.datasets;

@@ -28,13 +28,19 @@ export function beginFreeDrag(
   return {
     mode: "free",
     elements: elements.map((element) => {
+      const computed = getComputedStyle(element);
+      const isFlowRelative = computed.position === "relative";
       const rect = element.getBoundingClientRect();
       const parentRect = element.offsetParent?.getBoundingClientRect()
         ?? { left: 0, top: 0 };
       return {
         element,
-        left: rect.left - parentRect.left,
-        top: rect.top - parentRect.top,
+        left: isFlowRelative
+          ? parseFloat(element.style.left) || 0
+          : rect.left - parentRect.left,
+        top: isFlowRelative
+          ? parseFloat(element.style.top) || 0
+          : rect.top - parentRect.top,
         beforeLeft: inlineDeclaration(element, "left"),
         beforeTop: inlineDeclaration(element, "top")
       };

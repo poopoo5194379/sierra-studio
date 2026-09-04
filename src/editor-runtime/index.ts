@@ -1,13 +1,26 @@
 import type { CommandPayload, StyleDeclaration } from "../domain/commands/schema";
+import * as bundledECharts from "echarts";
+import "echarts-wordcloud";
 import {
+  canEditPlainText,
+  canEditRichText,
   explicitDeclaration,
   idOf,
   inlineDeclaration,
   isDynamicId,
   isRepeatedComponent,
+  persistentAnchorOf,
+  persistedIdOf,
+  richTextContainerFor,
+  ROOT_NODE_ID,
   selectionFor
 } from "./dom";
 import { DynamicNodeManager, DYNAMIC_PATCH_ATTRIBUTE } from "./dynamic-nodes";
+import { ResponsiveController } from "./features/responsive-controller";
+import { ThemeController } from "./features/theme-controller";
+import { WatermarkController } from "./features/watermark-controller";
+import { DocumentNavigator } from "./features/document-navigator";
+import { ComponentController } from "./features/component-controller";
 import {
   beginFlowDrag,
   finishFlowDrag,
@@ -30,7 +43,17 @@ import {
 } from "./protocol";
 import { SelectionOverlay, type ResizeDirection } from "./selection-overlay";
 import { ChartRegistry } from "./charts/chart-registry";
-import type { ChartPatch } from "./charts/types";
+import { styleProfileForSvg } from "./charts/svg-chart-adapter";
+import type { ChartPatch, ChartStyleProfile } from "./charts/types";
+import {
+  declarationsForPreset,
+  presetSignature,
+  styleTargetForElement
+} from "./features/style-preset-extractor";
+import type {
+  StylePreset,
+  StylePresetTarget
+} from "../domain/styles/style-preset";
 
 interface ResizeDrag {
   mode: "resize";
@@ -60,11 +83,57 @@ interface PendingDrag {
   startY: number;
 }
 
+interface ImageSlotCandidate {
+  container: HTMLElement;
+  kind: "image" | "container" | "background";
+  image?: HTMLImageElement;
+}
+
 type DragState = FlowDrag | FreeDrag | ResizeDrag | PendingDrag;
 type Alignment = "left" | "center" | "right" | "top" | "middle" | "bottom";
 const GEOMETRY_PROPERTIES = [
-  "position", "left", "top", "width", "height", "margin"
+  "position", "left", "right", "top", "bottom", "width", "height", "margin"
 ] as const;
+const FREE_ORIGIN_PROPERTY = "--hs-free-origin";
+const FREE_CONTAINER_ORIGIN_PROPERTY = "--hs-free-container-origin";
+
+function encodeFreeOrigin(declarations: StyleDeclaration[]): string {
+  return encodeURIComponent(JSON.stringify(declarations));
+}
+
+function decodeFreeOrigin(value: string): StyleDeclaration[] | null {
+  try {
+    const parsed = JSON.parse(decodeURIComponent(value));
+    if (!Array.isArray(parsed)) return null;
+    return parsed.filter((entry): entry is StyleDeclaration =>
+      entry
+      && typeof entry === "object"
+      && typeof entry.property === "string"
+      && typeof entry.value === "string"
+      && (entry.priority === "" || entry.priority === "important")
+      && typeof entry.existed === "boolean"
+    );
+  } catch {
+    return null;
+  }
+}
+
+function applyStyleDeclarations(
+  element: HTMLElement,
+  declarations: StyleDeclaration[]
+): void {
+  for (const declaration of declarations) {
+    if (!declaration.existed) {
+      element.style.removeProperty(declaration.property);
+    } else {
+      element.style.setProperty(
+        declaration.property,
+        declaration.value,
+        declaration.priority
+      );
+    }
+  }
+}
 
 function computeResizeDimensions(
   direction: ResizeDirection,
@@ -111,28 +180,16 @@ function computeResizePosition(
   return result;
 }
 
-// execCommand("fontSize", _, value) expects 1-7. Map px sizes to legacy scale.
-function parseFontSizeValue(value: string): number {
-  const m = /(\d+(?:\.\d+)?)/.exec(value);
-  if (!m) return 3;
-  const px = parseFloat(m[1]!);
-  if (px <= 10) return 1;
-  if (px <= 13) return 2;
-  if (px <= 17) return 3;
-  if (px <= 19) return 4;
-  if (px <= 23) return 5;
-  if (px <= 29) return 6;
-  return 7;
-}
-
 // ---- Phase 6: Chart Block helpers ----
 
 interface ChartBlockData {
   type: "line" | "bar" | "area" | "pie";
   xAxis: string[];
-  series: Array<{ name: string; data: number[] }>;
+  series: Array<{ name: string; data: number[]; color?: string }>;
   color: string;
   title?: string;
+  legendVisible?: boolean;
+  style?: ChartStyleProfile;
 }
 
 interface EChartInstance {
@@ -154,49 +211,198 @@ function getDefaultChartData(): ChartBlockData {
 }
 
 function buildEChartsOption(config: ChartBlockData): Record<string, unknown> {
+  const style = config.style;
+  const palette = style?.palette.length
+    ? style.palette
+    : config.series.flatMap((series) => series.color ? [series.color] : []);
+  const mutedColor = style?.mutedColor ?? "#738196";
+  const fontFamily = style?.fontFamily;
   if (config.type === "pie") {
     const s = config.series[0];
     const pieData = s
       ? (config.xAxis).map((label: string, i: number) => ({
         name: label,
-        value: s.data[i] ?? 0
+        value: s.data[i] ?? 0,
+        itemStyle: {
+          color: palette[i] ?? config.color,
+          opacity: style?.itemOpacity ?? 1,
+          borderColor: style?.borderColor ?? "transparent",
+          borderWidth: style?.borderWidth ?? 0
+        },
+        label: { color: palette[i] ?? mutedColor }
       }))
       : [];
+    const outerRadius = 66;
+    const innerRadius = Math.round(
+      outerRadius * (style?.pieInnerRatio ?? 0.45)
+    );
+    const centerText = style?.pieCenterText;
+    const centerSubtext = style?.pieCenterSubtext;
+    const valueByName = new Map(
+      config.xAxis.map((label, index) => [
+        label,
+        s?.data[index] ?? 0
+      ])
+    );
     return {
+      color: palette,
+      backgroundColor: "transparent",
+      textStyle: { color: mutedColor, fontFamily },
       tooltip: { trigger: "item" },
       title: config.title ? { text: config.title, left: "center", textStyle: { fontSize: 13 } } : undefined,
-      legend: { bottom: 0, type: "scroll" },
+      legend: {
+        show: config.legendVisible ?? true,
+        bottom: 0,
+        type: "scroll",
+        itemWidth: 12,
+        itemHeight: 8,
+        formatter: (name: string) =>
+          `${name} ${valueByName.get(name) ?? 0}%`,
+        textStyle: { color: mutedColor, fontFamily, fontSize: 11 }
+      },
+      graphic: centerText || centerSubtext ? [
+        ...(centerText ? [{
+          type: "text",
+          left: "center",
+          top: centerSubtext ? "41%" : "44%",
+          silent: true,
+          style: {
+            text: centerText,
+            fill: style?.pieCenterColor ?? style?.textColor ?? "#ffffff",
+            fontFamily,
+            fontSize: 28,
+            fontWeight: 700,
+            textAlign: "center"
+          }
+        }] : []),
+        ...(centerSubtext ? [{
+          type: "text",
+          left: "center",
+          top: "50%",
+          silent: true,
+          style: {
+            text: centerSubtext,
+            fill: style?.pieCenterSubtextColor ?? mutedColor,
+            fontFamily,
+            fontSize: 14,
+            textAlign: "center"
+          }
+        }] : [])
+      ] : undefined,
       series: [{
         type: "pie",
-        radius: ["30%", "70%"],
-        center: ["50%", "50%"],
+        radius: [`${innerRadius}%`, `${outerRadius}%`],
+        center: ["50%", "46%"],
         data: pieData,
-        emphasis: { itemStyle: { shadowBlur: 10, shadowColor: "rgba(0,0,0,0.3)" } },
-        color: pieData.map((_: unknown, i: number) => {
-          const colors = ["#4f7cff","#36b37e","#ff8f73","#ffc440","#8b5cf6","#0ea5e9"];
-          return colors[i % colors.length];
-        })
+        avoidLabelOverlap: true,
+        label: {
+          show: true,
+          position: "outside",
+          formatter: "{b} {c}%",
+          fontFamily,
+          fontSize: 12
+        },
+        labelLine: { show: false },
+        emphasis: {
+          scaleSize: 4,
+          itemStyle: {
+            shadowBlur: 10,
+            shadowColor: "rgba(0,0,0,0.3)"
+          }
+        }
       }]
     };
   }
-  // line/bar/area code stays the same
   const seriesType = config.type === "area" ? "line" : config.type;
+  const horizontalBars =
+    config.type === "bar" && style?.barOrientation === "horizontal";
+  const categoryAxis = {
+    type: "category",
+    data: config.xAxis,
+    boundaryGap: seriesType === "bar",
+    axisLine: { lineStyle: { color: style?.gridColor ?? "#d9deea" } },
+    axisTick: { show: false },
+    axisLabel: {
+      color: mutedColor,
+      fontFamily,
+      fontSize: 10,
+      interval: config.xAxis.length > 12 ? 2 : 0
+    }
+  };
+  const valueAxis = {
+    type: "value",
+    axisLabel: { color: mutedColor, fontFamily, fontSize: 10 },
+    axisLine: { show: false },
+    axisTick: { show: false },
+    splitLine: {
+      lineStyle: {
+        color: style?.gridColor ?? "#d9deea",
+        type: "dashed"
+      }
+    }
+  };
   return {
+    color: palette,
+    backgroundColor: "transparent",
+    textStyle: { color: mutedColor, fontFamily },
     tooltip: { trigger: "axis" },
-    grid: { left: 40, right: 20, top: config.title ? 40 : 30, bottom: 40 },
+    legend: {
+      show: (config.legendVisible ?? true) && config.series.length > 1,
+      top: 0,
+      left: 60,
+      itemWidth: 14,
+      itemHeight: 10,
+      textStyle: { color: mutedColor, fontFamily, fontSize: 11 }
+    },
+    grid: horizontalBars
+      ? { left: 80, right: 70, top: config.title ? 52 : 20, bottom: 30 }
+      : { left: 60, right: 60, top: config.title ? 52 : 30, bottom: 50 },
     title: config.title ? { text: config.title, left: 10, top: 5, textStyle: { fontSize: 13, fontWeight: "normal" } } : undefined,
-    xAxis: { type: "category", data: config.xAxis, boundaryGap: seriesType === "bar" },
-    yAxis: { type: "value" },
-    series: config.series.map((s) => ({
+    xAxis: horizontalBars ? valueAxis : categoryAxis,
+    yAxis: horizontalBars
+      ? { ...categoryAxis, inverse: true }
+      : valueAxis,
+    series: config.series.map((s, seriesIndex) => ({
       type: seriesType,
       name: s.name,
-      data: s.data,
+      data: config.type === "bar"
+        ? s.data.map((value, index) => ({
+          value,
+          itemStyle: {
+            color: style?.categoryColors?.[index]
+              ?? s.color
+              ?? palette[seriesIndex]
+              ?? config.color,
+            opacity: style?.barOpacity ?? 1,
+            borderRadius: style?.barRadius ?? 0
+          },
+          ...(style?.categoryLabelColors?.[index]
+            ? { label: { color: style.categoryLabelColors[index] } }
+            : {})
+        }))
+        : s.data,
       smooth: seriesType === "line",
       symbol: "circle",
-      symbolSize: 10,
-      areaStyle: config.type === "area" ? { opacity: 0.3 } : undefined,
-      itemStyle: { color: config.color },
-      lineStyle: { color: config.color, width: 2 }
+      symbolSize: style?.symbolSize ?? 8,
+      areaStyle: config.type === "area" || style?.areaOpacity !== undefined
+        ? { opacity: style?.areaOpacity ?? 0.3 }
+        : undefined,
+      itemStyle: { color: s.color ?? config.color },
+      label: config.type === "bar" && style?.showValues
+        ? {
+          show: true,
+          position: horizontalBars ? "right" : "top",
+          color: s.color ?? palette[seriesIndex] ?? mutedColor,
+          fontFamily,
+          fontSize: 11,
+          fontWeight: 600,
+          formatter: `{c}${style?.valueSuffix ?? ""}`
+        }
+        : undefined,
+      lineStyle: {
+        color: s.color ?? config.color,
+        width: style?.lineWidth ?? 2
+      }
     }))
   };
 }
@@ -211,17 +417,67 @@ class EditorRuntime {
   private readonly overlay = new SelectionOverlay();
   private readonly charts = new ChartRegistry();
   private readonly dynamicNodes = new DynamicNodeManager();
+  private readonly responsive = new ResponsiveController(
+    (payload) => this.commit(payload)
+  );
+  private readonly theme = new ThemeController(
+    (payload) => this.commit(payload)
+  );
+  private readonly watermarks = new WatermarkController(
+    (payload) => this.commit(payload),
+    (watermarkId) => postToHost({
+      type: "watermark-selected",
+      watermarkId
+    }),
+    (settings) => postToHost({
+      type: "watermarks-changed",
+      settings
+    })
+  );
+  private readonly navigator = new DocumentNavigator();
+  private readonly components = new ComponentController(
+    (payload) => this.commit(payload)
+  );
   // Track pointer-down state to distinguish click from drag
   private pointerDown: { x: number; y: number; target: HTMLElement; dragMoved: boolean } | null = null;
   private contentEditable: HTMLElement | null = null;
+  private contentEditableCommitTarget: HTMLElement | null = null;
+  private contentEditableBeforeHtml: string | null = null;
   private lastMouseWasDrag = false;
+  private readonly stylePreviewBefore = new Map<string, StyleDeclaration>();
+  private readonly textPreviewBefore = new Map<string, string>();
+  private imageSlotSelectionMode = false;
+  private imageSlotCandidates: ImageSlotCandidate[] = [];
+  private selectedImageSlots: ImageSlotCandidate[] = [];
+  private imageSlotOverlay: HTMLElement | null = null;
+  private savedTextRange: Range | null = null;
+  private formatPainterDeclarations: StyleDeclaration[] | null = null;
+  private textStylePreview: {
+    host: HTMLElement;
+    span: HTMLSpanElement;
+    property: string;
+    beforeHtml: string;
+  } | null = null;
 
   start(): void {
+    const runtimeWindow = window as typeof window & { echarts?: unknown };
+    if (!runtimeWindow.echarts) runtimeWindow.echarts = bundledECharts;
     this.installEditorEnvironment();
     this.dynamicNodes.start();
-    window.addEventListener("scroll", () => this.updateOverlay(), true);
-    window.addEventListener("resize", () => this.updateOverlay());
+    window.addEventListener("scroll", () => {
+      this.updateOverlay();
+      this.renderImageSlotOverlays();
+    }, true);
+    window.addEventListener("resize", () => {
+      this.updateOverlay();
+      this.renderImageSlotOverlays();
+    });
     window.addEventListener("message", (event) => this.onHostMessage(event));
+    window.addEventListener(
+      "click",
+      (event) => this.onWatermarkActivation(event),
+      true
+    );
     // Single click — select (immediate, no timer)
     document.addEventListener("click", (event) => this.onClick(event), true);
     // Double click — enter edit mode
@@ -245,6 +501,7 @@ class EditorRuntime {
     // Phase 6: initialize user-inserted chart elements
     window.setTimeout(() => this.initChartElements(), 500);
     postToHost({ type: "ready" });
+    this.emitImageSlotSelection();
   }
 
   private installEditorEnvironment(): void {
@@ -261,6 +518,15 @@ class EditorRuntime {
       [style*="scroll-snap-align"] {
         scroll-snap-align: none !important;
       }
+      /*
+       * Entrance animations frequently start at opacity: 0 and depend on a
+       * later script callback. A failure in an unrelated page module must not
+       * make otherwise editable content disappear from the authoring canvas.
+       */
+      .fade {
+        opacity: 1 !important;
+        transform: none !important;
+      }
       img {
         -webkit-user-drag: none;
         user-select: none;
@@ -270,12 +536,58 @@ class EditorRuntime {
         outline: 1px dashed rgba(79,124,255,0.55) !important;
         outline-offset: 2px !important;
       }
+      @keyframes hs-locate-pulse {
+        0%, 100% { box-shadow: 0 0 0 3px rgba(37,99,235,.24); }
+        45% { box-shadow: 0 0 0 8px rgba(37,99,235,.48); }
+      }
+      .hs-locate-flash {
+        outline: 3px solid #2563eb !important;
+        outline-offset: 4px !important;
+        animation: hs-locate-pulse .75s ease-in-out 2 !important;
+      }
     `;
     (document.head ?? document.documentElement).appendChild(style);
   }
 
   private selectionElements(): HTMLElement[] {
     return [...this.selected].filter((element) => element.isConnected);
+  }
+
+  private normalizeObjectSelection(
+    elements: HTMLElement[]
+  ): HTMLElement[] {
+    if (elements.length < 2) return elements;
+    let commonParent = elements[0]?.parentElement ?? null;
+    while (
+      commonParent
+      && !elements.every((element) => commonParent!.contains(element))
+    ) {
+      commonParent = commonParent.parentElement;
+    }
+    if (!commonParent || commonParent === document.documentElement) {
+      return elements;
+    }
+    const promoted = elements.map((element) => {
+      let current = element;
+      while (
+        current.parentElement
+        && current.parentElement !== commonParent
+      ) {
+        current = current.parentElement;
+      }
+      return current;
+    });
+    const unique = [...new Set(promoted)];
+    return unique.length >= 2 ? unique : elements;
+  }
+
+  private replaceSelection(elements: HTMLElement[]): void {
+    const previousPrimary = this.primary;
+    this.selected.clear();
+    for (const element of elements) this.selected.add(element);
+    this.primary = elements.find((element) =>
+      previousPrimary ? element.contains(previousPrimary) : false
+    ) ?? elements.at(-1) ?? null;
   }
 
   private updateOverlay(): void {
@@ -313,15 +625,29 @@ class EditorRuntime {
       textAlign: computed.textAlign,
       fontSize: computed.fontSize,
       position: computed.position,
+      freeMovement:
+        primary.style.getPropertyValue(FREE_ORIGIN_PROPERTY) !== "",
+      zIndex: Number.parseInt(computed.zIndex, 10) || 0,
       isComponent: isRepeatedComponent(primary),
       width: Math.round(rect.width),
       height: Math.round(rect.height),
       text: primary.textContent ?? "",
-      canEditText: !chart && primary.tagName !== "IMG",
+      canEditText: !chart && canEditPlainText(primary),
+      canEditRichText: !chart && canEditRichText(primary),
       borderRadius: computed.borderRadius,
       backgroundColor: computed.backgroundColor,
+      styleProfile: {
+        target: styleTargetForElement(primary),
+        declarations: declarationsForPreset(
+          computed,
+          styleTargetForElement(primary)
+        )
+      },
       ...(primary.tagName === "IMG" && primary instanceof HTMLImageElement
         ? { imageSrc: primary.src }
+        : {}),
+      ...(primary.tagName === "VIDEO" && primary instanceof HTMLVideoElement
+        ? { videoSrc: primary.currentSrc || primary.src }
         : {}),
       ...(chart ? { chart } : {})
     };
@@ -339,8 +665,21 @@ class EditorRuntime {
       selection.isSymbol = true;
       selection.symbolId = primary.getAttribute("data-hs-symbol") ?? "";
     }
+    selection.responsiveOverrides = this.responsive.rulesFor(primary);
+    const component = this.components.describe(primary);
+    if (component) selection.component = component;
+    const browserSelection = window.getSelection();
+    const caretInsidePrimary = Boolean(
+      browserSelection?.isCollapsed
+      && browserSelection.anchorNode
+      && primary.contains(browserSelection.anchorNode)
+    );
     // GrapesJS StyleManager: live text formatting state
-    if (selection.hasTextSelection || primary.isContentEditable) {
+    if (
+      selection.hasTextSelection
+      || primary.isContentEditable
+      || caretInsidePrimary
+    ) {
       selection.textFormat = {
         bold: document.queryCommandState("bold"),
         italic: document.queryCommandState("italic"),
@@ -354,6 +693,7 @@ class EditorRuntime {
   }
 
   private setSelection(element: HTMLElement | null, additive = false): void {
+    if (element !== this.primary) this.savedTextRange = null;
     if (!additive) this.selected.clear();
     if (element) {
       if (additive && this.selected.has(element)) {
@@ -364,6 +704,11 @@ class EditorRuntime {
       } else {
         this.selected.add(element);
         this.primary = element;
+        if (additive && this.selected.size >= 2) {
+          this.replaceSelection(
+            this.normalizeObjectSelection(this.selectionElements())
+          );
+        }
       }
     } else if (!additive) {
       this.primary = null;
@@ -371,20 +716,39 @@ class EditorRuntime {
     this.emitSelection();
   }
 
-  private enterContentEditable(target: HTMLElement): void {
+  private enterContentEditable(
+    target: HTMLElement,
+    caretPoint?: { x: number; y: number },
+    persistence?: { target: HTMLElement; beforeHtml: string }
+  ): void {
     if (this.contentEditable && this.contentEditable !== target) {
       this.commitContentEditable();
     }
-    if (target.tagName === "IMG") return;
+    if (!canEditRichText(target)) {
+      this.setSelection(target);
+      postToHost({
+        type: "notice",
+        message: "该对象包含布局或脚本结构，请选择内部文字节点进行编辑"
+      });
+      return;
+    }
     this.setSelection(target);
     this.contentEditable = target;
-    // Save original text for later comparison
-    const before = target.textContent ?? "";
-    target.dataset.hsOriginalText = before;
+    this.contentEditableCommitTarget = persistence?.target ?? target;
+    this.contentEditableBeforeHtml =
+      persistence?.beforeHtml ?? target.innerHTML;
     target.contentEditable = "true";
     target.focus();
-    const range = document.createRange();
-    range.selectNodeContents(target);
+    let range = caretPoint
+      ? document.caretRangeFromPoint?.(caretPoint.x, caretPoint.y) ?? null
+      : null;
+    if (!range || !target.contains(range.startContainer)) {
+      range = document.createRange();
+      range.selectNodeContents(target);
+      range.collapse(false);
+    } else {
+      range.collapse(true);
+    }
     const browserSelection = window.getSelection();
     browserSelection?.removeAllRanges();
     browserSelection?.addRange(range);
@@ -397,15 +761,17 @@ class EditorRuntime {
   private commitContentEditable(): void {
     if (!this.contentEditable) return;
     const target = this.contentEditable;
-    const before = target.dataset.hsOriginalText ?? target.textContent ?? "";
-    const after = target.textContent ?? "";
-    delete target.dataset.hsOriginalText;
+    const commitTarget = this.contentEditableCommitTarget ?? target;
+    const before = this.contentEditableBeforeHtml ?? commitTarget.innerHTML;
     target.removeAttribute("contenteditable");
+    const after = commitTarget.innerHTML;
     this.contentEditable = null;
+    this.contentEditableCommitTarget = null;
+    this.contentEditableBeforeHtml = null;
     if (after !== before) {
       this.commit({
-        type: "text.set",
-        nodeId: idOf(target),
+        type: "text.patchStyle",
+        nodeId: idOf(commitTarget),
         before,
         after
       });
@@ -422,7 +788,8 @@ class EditorRuntime {
   }
 
   private commit(payload: CommandPayload): void {
-    for (const converted of this.dynamicNodes.convert(payload)) {
+    const componentPayload = this.components.convert(payload);
+    for (const converted of this.dynamicNodes.convert(componentPayload)) {
       postToHost({ type: "command", payload: converted });
       // GrapesJS Symbols: propagate changes to other instances
       if (converted.type === "styles.set") {
@@ -480,7 +847,13 @@ class EditorRuntime {
           }
           // If we just replaced the dynamic-patch manifest, re-apply it.
           if (payload.name === DYNAMIC_PATCH_ATTRIBUTE) {
-            this.dynamicNodes.replay();
+            // A manifest describes edits to DOM that the page script owns.
+            // Replaying the new manifest can apply forward changes, but it
+            // cannot reconstruct properties/nodes removed by an undo. Reload
+            // the isolated canvas so the page script recreates its baseline,
+            // then DynamicNodeManager replays exactly the target manifest.
+            window.location.reload();
+            return;
           }
           // Chart manifest updates: refresh chart overrides.
           if (payload.name === "data-hs-chart-manifest" || element.tagName === "SCRIPT") {
@@ -496,7 +869,7 @@ class EditorRuntime {
           for (const [name, value] of Object.entries(payload.node.attributes)) {
             newNode.setAttribute(name, value);
           }
-          newNode.textContent = payload.node.text;
+          newNode.innerHTML = payload.node.text;
           const ref = parent.children.item(payload.index);
           if (ref) parent.insertBefore(newNode, ref);
           else parent.appendChild(newNode);
@@ -518,9 +891,83 @@ class EditorRuntime {
           break;
         }
         case "chart.patch":
-          // The host's command is already converted; we update the
-          // registry from the manifest the host just wrote.
-          this.charts.restoreOverrides();
+          // Undo/redo updates the authoritative file outside this iframe.
+          // Apply the command payload directly instead of replaying the
+          // registry's stale in-memory manifest.
+          this.charts.applyOverride(payload.chartKey, payload.after);
+          break;
+        case "document.patch":
+          let dynamicManifestChanged = false;
+          let chartBlockChanged = false;
+          for (const change of payload.attributes) {
+            const element = this.findNodeById(change.nodeId);
+            if (!element) continue;
+            if (change.after === null) element.removeAttribute(change.name);
+            else element.setAttribute(change.name, change.after);
+            if (change.name === DYNAMIC_PATCH_ATTRIBUTE) {
+              dynamicManifestChanged = true;
+            }
+            if (
+              change.name === "data-hs-chart"
+              || change.name === "data-hs-chart-data"
+            ) {
+              chartBlockChanged = true;
+            }
+          }
+          for (const change of payload.managedStyles) {
+            const selector =
+              `style[data-hs-managed-style="${CSS.escape(change.styleId)}"]`;
+            const existing =
+              document.querySelector<HTMLStyleElement>(selector);
+            if (change.after === null) {
+              existing?.remove();
+              continue;
+            }
+            const style = existing ?? document.createElement("style");
+            style.dataset.hsManagedStyle = change.styleId;
+            style.textContent = change.after;
+            if (!existing) {
+              (document.head ?? document.documentElement).appendChild(style);
+            }
+          }
+          if (dynamicManifestChanged || chartBlockChanged) {
+            window.location.reload();
+            return;
+          }
+          break;
+        case "component.update":
+          for (const change of payload.texts) {
+            const element = this.findNodeById(change.nodeId);
+            if (element) element.textContent = change.after;
+          }
+          for (const change of payload.html) {
+            const element = this.findNodeById(change.nodeId);
+            if (element) element.innerHTML = change.after;
+          }
+          for (const change of payload.styles) {
+            const element = this.findNodeById(change.nodeId);
+            if (!element) continue;
+            for (const declaration of change.after) {
+              if (!declaration.existed) {
+                element.style.removeProperty(declaration.property);
+              } else {
+                element.style.setProperty(
+                  declaration.property,
+                  declaration.value,
+                  declaration.priority
+                );
+              }
+            }
+          }
+          for (const change of payload.attributes) {
+            const element = this.findNodeById(change.nodeId);
+            if (!element) continue;
+            if (change.after === null) element.removeAttribute(change.name);
+            else element.setAttribute(change.name, change.after);
+          }
+          break;
+        case "watermarks.set":
+          this.watermarks.applyFromHistory(payload.after);
           break;
       }
     } catch (error) {
@@ -541,9 +988,40 @@ class EditorRuntime {
 
   private findNodeById(nodeId: string): HTMLElement | null {
     if (!nodeId) return null;
+    if (nodeId === ROOT_NODE_ID) return document.body;
     return document.querySelector<HTMLElement>(
       `[data-hs-id="${CSS.escape(nodeId)}"]`
     );
+  }
+
+  private locateNode(nodeId: string): void {
+    const target = this.findNodeById(nodeId);
+    if (!target) {
+      postToHost({ type: "notice", message: "未找到对应元素，文档结构可能已变化" });
+      return;
+    }
+    this.commitContentEditable();
+    if (this.imageSlotSelectionMode) {
+      this.imageSlotSelectionMode = false;
+      this.renderImageSlotOverlays();
+      this.emitImageSlotSelection();
+    }
+    this.setSelection(target);
+    target.scrollIntoView({
+      behavior: "auto",
+      block: "center",
+      inline: "center"
+    });
+    target.classList.remove("hs-locate-flash");
+    void target.offsetWidth;
+    target.classList.add("hs-locate-flash");
+    window.setTimeout(() => {
+      target.classList.remove("hs-locate-flash");
+    }, 1600);
+    window.requestAnimationFrame(() => {
+      this.updateOverlay();
+      this.emitSelection();
+    });
   }
 
   private onClick(event: MouseEvent): void {
@@ -556,6 +1034,28 @@ class EditorRuntime {
     if (this.overlay.isResizeHandle(event.target)) return;
     const target = event.target instanceof Element ? event.target : null;
     if (!target) return;
+    if (this.imageSlotSelectionMode || event.altKey) {
+      if (event.altKey) this.refreshImageSlotCandidates();
+      const candidate = this.findImageSlotCandidate(target);
+      if (candidate) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        this.toggleImageSlotCandidate(candidate);
+        this.renderImageSlotOverlays();
+        this.emitImageSlotSelection();
+        if (event.altKey && !this.imageSlotSelectionMode) {
+          postToHost({
+            type: "notice",
+            message: `已选择 ${this.selectedImageSlots.length} 个图片槽；按 Alt + 单击继续选择或取消`
+          });
+        }
+      } else if (event.altKey) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        postToHost({ type: "notice", message: "该位置未识别为图片槽" });
+      }
+      return;
+    }
 
     // Pending image placement → click inserts image (preventDefault so browser doesn't swallow it)
     if (this.pendingImagePath) {
@@ -580,26 +1080,135 @@ class EditorRuntime {
       this.setSelection(null);
       return;
     }
+    if (this.formatPainterDeclarations) {
+      event.preventDefault();
+      event.stopPropagation();
+      this.applyFormatPainter(selectable);
+      return;
+    }
     this.setSelection(selectable, event.shiftKey || event.ctrlKey || event.metaKey);
   }
 
+  private onWatermarkActivation(event: MouseEvent): void {
+    const target = event.target instanceof Element ? event.target : null;
+    const watermark = target?.closest<HTMLElement>(
+      "[data-hs-watermark-id]"
+    );
+    if (!watermark) return;
+    this.lastMouseWasDrag = false;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    postToHost({
+      type: "watermark-selected",
+      watermarkId: watermark.getAttribute("data-hs-watermark-id") ?? ""
+    });
+  }
+
   private onDoubleClick(event: MouseEvent): void {
-    const target = event.target instanceof Element
-      ? event.target.closest<HTMLElement>("[data-hs-id]")
-      : null;
-    if (!target || target.tagName === "IMG") return;
+    if (this.imageSlotSelectionMode || event.altKey) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      return;
+    }
+    const eventTarget = event.target instanceof Element ? event.target : null;
+    if (this.contentEditable && eventTarget && this.contentEditable.contains(eventTarget)) {
+      // Once text editing is active, preserve the browser's native double-click
+      // behavior so a second double-click selects the word under the pointer.
+      return;
+    }
     const chartHandle = this.charts.find(
       event.target instanceof Element ? event.target : null
     );
-    if (chartHandle && chartHandle.element === target) return;
+    if (chartHandle) return;
+    let target = richTextContainerFor(eventTarget);
+    let persistence:
+      | { target: HTMLElement; beforeHtml: string }
+      | undefined;
+    if (!target && eventTarget instanceof HTMLElement) {
+      const wrapped = this.wrapDirectTextRunAtPoint(eventTarget, {
+        x: event.clientX,
+        y: event.clientY
+      });
+      target = wrapped?.target ?? null;
+      persistence = wrapped?.persistence;
+    }
+    if (!target || target.tagName === "IMG") return;
     event.preventDefault();
     event.stopPropagation();
     this.pointerDown = null;
-    // Enter edit mode on the target element directly
-    this.enterContentEditable(target);
+    // First double-click enters text editing with a caret at the pointer.
+    this.enterContentEditable(
+      target,
+      { x: event.clientX, y: event.clientY },
+      persistence
+    );
+  }
+
+  private wrapDirectTextRunAtPoint(
+    eventTarget: HTMLElement,
+    point: { x: number; y: number }
+  ): {
+    target: HTMLElement;
+    persistence: { target: HTMLElement; beforeHtml: string };
+  } | null {
+    const range = document.caretRangeFromPoint?.(point.x, point.y) ?? null;
+    const startNode = range?.startContainer;
+    const parent = startNode?.nodeType === Node.TEXT_NODE
+      ? startNode.parentElement
+      : eventTarget;
+    if (
+      !(parent instanceof HTMLElement)
+      || parent === document.body
+      || !idOf(parent)
+      || parent.matches(
+        "script,style,svg,table,thead,tbody,tfoot,tr,ul,ol,select,option"
+      )
+      || parent.querySelector("script,canvas,iframe")
+    ) {
+      return null;
+    }
+    const nodes = [...parent.childNodes];
+    const startIndex = startNode && startNode.parentNode === parent
+      ? nodes.indexOf(startNode as ChildNode)
+      : -1;
+    if (startIndex < 0) return null;
+    const isInlineNode = (node: ChildNode): boolean =>
+      node.nodeType === Node.TEXT_NODE
+      || (
+        node instanceof HTMLElement
+        && !node.matches(
+          "address,article,aside,blockquote,canvas,div,dl,fieldset,figure,"
+          + "footer,form,header,hr,iframe,main,nav,ol,section,table,ul,video"
+        )
+      );
+    let first = startIndex;
+    let last = startIndex;
+    while (first > 0 && isInlineNode(nodes[first - 1]!)) first -= 1;
+    while (last < nodes.length - 1 && isInlineNode(nodes[last + 1]!)) last += 1;
+    const run = nodes.slice(first, last + 1);
+    if (!run.some((node) =>
+      node.nodeType === Node.TEXT_NODE && Boolean(node.textContent?.trim())
+    )) {
+      return null;
+    }
+    const beforeHtml = parent.innerHTML;
+    const wrapper = document.createElement("span");
+    wrapper.setAttribute("data-hs-id", `node_${crypto.randomUUID()}`);
+    wrapper.setAttribute("data-hs-text-run", "");
+    parent.insertBefore(wrapper, run[0] ?? null);
+    for (const node of run) wrapper.appendChild(node);
+    return {
+      target: wrapper,
+      persistence: { target: parent, beforeHtml }
+    };
   }
 
   private onContextMenu(event: MouseEvent): void {
+    if (this.imageSlotSelectionMode) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      return;
+    }
     const target = event.target instanceof Element
       ? event.target.closest<HTMLElement>("[data-hs-id]")
       : null;
@@ -618,8 +1227,10 @@ class EditorRuntime {
   private hoveredEl: HTMLElement | null = null;
 
   private onHover(event: MouseEvent): void {
+    if (this.imageSlotSelectionMode) return;
     const target = event.target instanceof Element ? event.target : null;
     if (!target) return;
+    if (target.closest("[data-hs-watermark-id]")) return;
     const el = target.closest<HTMLElement>("[data-hs-id]");
     if (!el || el === this.hoveredEl || el.isContentEditable) return;
     if (el.tagName === "BODY" || el.tagName === "HTML") return;
@@ -636,6 +1247,13 @@ class EditorRuntime {
   }
 
   private onMouseDown(event: MouseEvent): void {
+    if (this.imageSlotSelectionMode || event.altKey) {
+      this.lastMouseWasDrag = false;
+      this.pointerDown = null;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      return;
+    }
     this.lastMouseWasDrag = false;
     // 0. Always tell the host to dismiss the floating text toolbar on any
     // mousedown inside the canvas. The text selection is about to be
@@ -693,9 +1311,13 @@ class EditorRuntime {
     if (!this.selected.has(element)) this.setSelection(element);
 
     const computed = getComputedStyle(element);
-    if (["absolute", "fixed"].includes(computed.position)) {
+    if (
+      ["absolute", "fixed"].includes(computed.position)
+      || element.style.getPropertyValue(FREE_ORIGIN_PROPERTY) !== ""
+    ) {
       const movable = this.selectionElements().filter(c =>
         ["absolute", "fixed"].includes(getComputedStyle(c).position)
+        || c.style.getPropertyValue(FREE_ORIGIN_PROPERTY) !== ""
       );
       this.drag = {
         mode: "pending",
@@ -706,7 +1328,7 @@ class EditorRuntime {
         startX: event.clientX,
         startY: event.clientY
       };
-    } else if (isRepeatedComponent(element) && !isDynamicId(idOf(element))) {
+    } else if (isRepeatedComponent(element)) {
       this.drag = {
         mode: "pending",
         kind: "flow",
@@ -825,8 +1447,37 @@ class EditorRuntime {
   }
 
   private onKeyDown(event: KeyboardEvent): void {
+    const ctrl = event.ctrlKey || event.metaKey;
+    const key = event.key.toLowerCase();
+    const typing = this.contentEditable
+      || event.target instanceof HTMLInputElement
+      || event.target instanceof HTMLTextAreaElement
+      || (
+        event.target instanceof HTMLElement
+        && event.target.isContentEditable
+      );
+    if (ctrl && !typing && (key === "z" || key === "y")) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      postToHost({
+        type: "history-request",
+        direction: key === "y" || event.shiftKey ? "redo" : "undo"
+      });
+      return;
+    }
+    if (this.imageSlotSelectionMode && event.key === "Escape") {
+      event.preventDefault();
+      this.clearImageSlotSelection();
+      postToHost({ type: "notice", message: "已退出图片槽选择" });
+      return;
+    }
     // Escape: exit text edit, or deselect
     if (event.key === "Escape") {
+      if (this.formatPainterDeclarations) {
+        this.cancelFormatPainter();
+        event.preventDefault();
+        return;
+      }
       if (this.contentEditable) {
         this.commitContentEditable();
         event.preventDefault();
@@ -861,11 +1512,32 @@ class EditorRuntime {
       case "set-style":
         this.setStyle(message.declarations);
         break;
+      case "preview-style":
+        this.previewStyle(message.declarations);
+        break;
+      case "commit-style":
+        this.commitStylePreview(message.declarations);
+        break;
+      case "cancel-style-preview":
+        this.cancelStylePreview();
+        break;
+      case "request-style-presets":
+        this.reportStylePresets();
+        break;
       case "convert-free":
         this.convertToLocalFree();
         break;
+      case "toggle-free":
+        this.toggleFreeMovement();
+        break;
       case "set-text":
         this.setText(message.text);
+        break;
+      case "preview-text":
+        this.previewText(message.text);
+        break;
+      case "commit-text":
+        this.commitTextPreview(message.text);
         break;
       case "align":
         this.alignSelection(message.alignment);
@@ -876,8 +1548,20 @@ class EditorRuntime {
       case "chart-patch":
         this.patchChart(message.patch);
         break;
+      case "convert-svg-chart":
+        this.convertSvgChart();
+        break;
       case "image":
         this.acceptImage(message.path);
+        break;
+      case "images":
+        this.acceptImages(message.images);
+        break;
+      case "select-image-slots":
+        this.selectImageSlots(message.mode);
+        break;
+      case "video":
+        this.acceptVideoAsset(message.path, message.title);
         break;
       case "save-editor-state":
         this.reportState();
@@ -893,6 +1577,12 @@ class EditorRuntime {
         break;
       case "text-style":
         this.applyTextStyle(message.property, message.value);
+        break;
+      case "preview-text-style":
+        this.previewTextStyle(message.property, message.value);
+        break;
+      case "commit-text-style":
+        this.commitTextStylePreview(message.property, message.value);
         break;
       case "call-delete":
         this.deleteSelected();
@@ -911,6 +1601,9 @@ class EditorRuntime {
         break;
       case "request-source":
         this.reportSource();
+        break;
+      case "materialize-document":
+        void this.materializeDocument();
         break;
       case "change-chart-type":
         this.changeChartType(message.chartType);
@@ -931,16 +1624,187 @@ class EditorRuntime {
         this.selectAllInContainer();
         break;
       case "edit-selected":
-        if (this.primary && this.primary.tagName !== "IMG") this.enterContentEditable(this.primary);
+        if (this.primary && this.primary.tagName !== "IMG") {
+          this.enterContentEditable(
+            richTextContainerFor(this.primary) ?? this.primary
+          );
+        }
         break;
       case "toggle-symbol":
         this.toggleSymbol();
+        break;
+      case "format-painter-start":
+        this.startFormatPainter();
+        break;
+      case "format-painter-cancel":
+        this.cancelFormatPainter();
+        break;
+      case "responsive-style":
+        if (!this.primary) break;
+        try {
+          this.responsive.apply(
+            this.primary,
+            message.breakpoint,
+            message.declarations
+          );
+          this.emitSelection();
+        } catch (error) {
+          postToHost({
+            type: "notice",
+            message: error instanceof Error ? error.message : "断点样式保存失败"
+          });
+        }
+        break;
+      case "preview-responsive-style":
+        if (!this.primary) break;
+        try {
+          this.responsive.preview(
+            this.primary,
+            message.breakpoint,
+            message.declarations
+          );
+          this.updateOverlay();
+        } catch (error) {
+          postToHost({
+            type: "notice",
+            message: error instanceof Error ? error.message : "断点样式预览失败"
+          });
+        }
+        break;
+      case "commit-responsive-style":
+        if (!this.primary) break;
+        try {
+          this.responsive.commitPreview(
+            this.primary,
+            message.breakpoint,
+            message.declarations
+          );
+          this.emitSelection();
+        } catch (error) {
+          postToHost({
+            type: "notice",
+            message: error instanceof Error ? error.message : "断点样式保存失败"
+          });
+        }
+        break;
+      case "responsive-visibility":
+        if (!this.primary) break;
+        try {
+          this.responsive.apply(
+            this.primary,
+            message.breakpoint,
+            [{ property: "display", value: message.visible ? "" : "none" }]
+          );
+          this.emitSelection();
+        } catch (error) {
+          postToHost({
+            type: "notice",
+            message: error instanceof Error ? error.message : "断点可见性保存失败"
+          });
+        }
+        break;
+      case "request-responsive-audit":
+        void this.responsive.audit().then((report) => {
+          postToHost({
+            type: "responsive-audit",
+            report,
+            importedMediaQueries: this.responsive.importedMediaQueries()
+          });
+        });
+        break;
+      case "preview-theme":
+        this.theme.preview(message.css, message.mode);
+        break;
+      case "commit-theme":
+        this.theme.commitPreview(message.css, message.mode);
+        break;
+      case "cancel-theme-preview":
+        this.theme.cancelPreview();
+        break;
+      case "sync-watermarks":
+        this.watermarks.sync(message.settings);
+        break;
+      case "preview-watermarks":
+        this.watermarks.preview(message.settings);
+        break;
+      case "commit-watermarks":
+        this.watermarks.commit(message.settings);
+        break;
+      case "cancel-watermark-preview":
+        this.watermarks.cancelPreview();
+        break;
+      case "request-watermark-candidates":
+        postToHost({
+          type: "watermark-candidates",
+          candidates: this.watermarks.detectLegacyCandidates()
+        });
+        break;
+      case "search-document":
+        postToHost({
+          type: "document-navigation",
+          navigation: this.navigator.search(message.query, message.filter)
+        });
+        break;
+      case "locate-node":
+        this.locateNode(message.nodeId);
+        break;
+      case "component-create":
+        if (!this.primary) break;
+        try {
+          this.components.create(this.primary, message.name);
+          this.emitSelection();
+          postToHost({ type: "notice", message: "已创建主组件" });
+        } catch (error) {
+          postToHost({
+            type: "notice",
+            message: error instanceof Error ? error.message : "组件创建失败"
+          });
+        }
+        break;
+      case "component-duplicate":
+        if (!this.primary) break;
+        try {
+          const instance = this.components.duplicate(this.primary);
+          this.setSelection(instance);
+          postToHost({ type: "notice", message: "已创建组件实例" });
+        } catch (error) {
+          postToHost({
+            type: "notice",
+            message: error instanceof Error ? error.message : "实例创建失败"
+          });
+        }
+        break;
+      case "component-detach":
+        if (!this.primary) break;
+        try {
+          this.components.detach(this.primary);
+          this.emitSelection();
+          postToHost({ type: "notice", message: "实例已分离为普通元素" });
+        } catch (error) {
+          postToHost({
+            type: "notice",
+            message: error instanceof Error ? error.message : "组件分离失败"
+          });
+        }
+        break;
+      case "component-reset-field":
+        if (!this.primary) break;
+        try {
+          this.components.resetCurrentField(this.primary);
+          this.emitSelection();
+          postToHost({ type: "notice", message: "已恢复主组件字段" });
+        } catch (error) {
+          postToHost({
+            type: "notice",
+            message: error instanceof Error ? error.message : "字段恢复失败"
+          });
+        }
         break;
       case "select-next-sibling":
         this.selectNextSibling(message.forward);
         break;
       case "insert-block":
-        this.insertBlock(message.blockType);
+        this.insertBlock(message.blockType, message.placement);
         break;
     }
   }
@@ -956,15 +1820,22 @@ class EditorRuntime {
         const config: ChartBlockData = { ...before };
         // Merge the patch data into config
         if (patch.title !== undefined) config.title = patch.title;
+        if (patch.legendVisible !== undefined) {
+          config.legendVisible = patch.legendVisible;
+        }
         if (patch.primaryColor !== undefined) config.color = patch.primaryColor;
         if (patch.data) {
           if (patch.data.labels) config.xAxis = patch.data.labels as string[];
-          if (patch.data.series[0]) {
-            config.series = config.series.map((s, i) => ({
-              ...s,
-              ...(patch.data!.series[i] ? { data: patch.data!.series[i]!.data as number[] } : {})
-            }));
-          }
+          config.series = patch.data.series.map((series, index) => {
+            const color = series.color ?? config.series[index]?.color;
+            return {
+              name: series.name
+                ?? config.series[index]?.name
+                ?? `系列 ${index + 1}`,
+              data: series.data as number[],
+              ...(color ? { color } : {})
+            };
+          });
         }
         this.primary.dataset.hsChartData = JSON.stringify(config);
         // Get existing ECharts instance, NEVER call init() again
@@ -1021,6 +1892,103 @@ class EditorRuntime {
     this.emitSelection();
   }
 
+  private convertSvgChart(): void {
+    if (!this.primary) return;
+    const handle = this.charts.findByElement(this.primary)
+      ?? this.charts.find(this.primary);
+    if (!handle) {
+      postToHost({ type: "notice", message: "请先选中一个 SVG 图表" });
+      return;
+    }
+    const snapshot = this.charts.snapshot(handle);
+    if (
+      snapshot.engine !== "svg"
+      || !snapshot.conversion?.supported
+      || !snapshot.data
+      || !snapshot.conversion.suggestedType
+    ) {
+      postToHost({
+        type: "notice",
+        message: snapshot.conversion?.reason ?? "当前图表无法可靠恢复数据"
+      });
+      return;
+    }
+
+    const nodeId = idOf(handle.element);
+    if (isDynamicId(nodeId)) {
+      postToHost({
+        type: "notice",
+        message: "这个图表缺少可持久化容器，暂时不能转换"
+      });
+      return;
+    }
+    const labels = (snapshot.data.labels ?? []).map(String);
+    const series = snapshot.data.series.map((source, index) => ({
+      name: source.name ?? `系列 ${index + 1}`,
+      data: source.data.map(Number),
+      ...(source.color ? { color: source.color } : {})
+    }));
+    if (
+      labels.length === 0
+      || series.length === 0
+      || series.some((item) =>
+        item.data.length !== labels.length
+        || item.data.some((value) => !Number.isFinite(value))
+      )
+    ) {
+      postToHost({
+        type: "notice",
+        message: "恢复出的数据不完整，已保留原始 SVG"
+      });
+      return;
+    }
+
+    const config: ChartBlockData = {
+      type: snapshot.conversion.suggestedType,
+      xAxis: labels,
+      series,
+      color: snapshot.primaryColor ?? series[0]?.color ?? "#4f7cff",
+      title: "",
+      legendVisible: true,
+      ...(snapshot.conversion.style
+        ? { style: snapshot.conversion.style }
+        : {})
+    };
+    const element = handle.element;
+    const beforeChart = element.getAttribute("data-hs-chart");
+    const beforeData = element.getAttribute("data-hs-chart-data");
+    const afterChart = `echarts-${config.type}`;
+    const afterData = JSON.stringify(config);
+    element.setAttribute("data-hs-chart", afterChart);
+    element.setAttribute("data-hs-chart-data", afterData);
+    element.innerHTML = "";
+    (element as HTMLElement & { _hsChartReady?: boolean })._hsChartReady = false;
+    this.commit({
+      type: "document.patch",
+      attributes: [
+        {
+          nodeId,
+          name: "data-hs-chart",
+          before: beforeChart,
+          after: afterChart
+        },
+        {
+          nodeId,
+          name: "data-hs-chart-data",
+          before: beforeData,
+          after: afterData
+        }
+      ],
+      managedStyles: []
+    });
+    this.initChartElements();
+    this.setSelection(element);
+    postToHost({
+      type: "notice",
+      message: `已转换为可编辑${config.type === "pie" ? "饼图" : "折线图"}，可随时撤销恢复原图`
+    });
+  }
+
   private setStyle(
     declarations: Array<Pick<StyleDeclaration, "property" | "value" | "priority">>
   ): void {
@@ -1049,8 +2017,297 @@ class EditorRuntime {
     this.emitSelection();
   }
 
+  private startFormatPainter(): void {
+    if (!this.primary) {
+      postToHost({ type: "notice", message: "请先选择要复制格式的元素" });
+      return;
+    }
+    const computed = getComputedStyle(this.primary);
+    const properties = [
+      "color",
+      "background-color",
+      "font-family",
+      "font-size",
+      "font-weight",
+      "font-style",
+      "text-decoration",
+      "text-align",
+      "line-height",
+      "letter-spacing",
+      "border",
+      "border-radius",
+      "padding"
+    ] as const;
+    this.formatPainterDeclarations = properties.map((property) =>
+      explicitDeclaration(
+        property,
+        computed.getPropertyValue(property),
+        computed.getPropertyPriority(property) === "important"
+          ? "important"
+          : ""
+      )
+    );
+    postToHost({ type: "format-painter-state", active: true });
+    postToHost({ type: "notice", message: "格式刷已启用，请点击目标元素；Esc 取消" });
+  }
+
+  private cancelFormatPainter(): void {
+    this.formatPainterDeclarations = null;
+    postToHost({ type: "format-painter-state", active: false });
+    postToHost({ type: "notice", message: "格式刷已取消" });
+  }
+
+  private applyFormatPainter(target: HTMLElement): void {
+    const declarations = this.formatPainterDeclarations;
+    if (!declarations) return;
+    const before = declarations.map(({ property }) =>
+      inlineDeclaration(target, property)
+    );
+    for (const declaration of declarations) {
+      target.style.setProperty(
+        declaration.property,
+        declaration.value,
+        declaration.priority
+      );
+    }
+    const after = declarations.map(({ property }) =>
+      inlineDeclaration(target, property)
+    );
+    this.commit({
+      type: "styles.set",
+      nodes: [{ nodeId: idOf(target), before, after }]
+    });
+    this.formatPainterDeclarations = null;
+    postToHost({ type: "format-painter-state", active: false });
+    this.setSelection(target);
+    postToHost({ type: "notice", message: "格式已应用" });
+  }
+
+  private previewStyle(
+    declarations: Array<Pick<StyleDeclaration, "property" | "value" | "priority">>
+  ): void {
+    const elements = this.selectionElements();
+    for (const element of elements) {
+      const nodeId = idOf(element);
+      for (const declaration of declarations) {
+        const key = `${nodeId}\u0000${declaration.property}`;
+        if (!this.stylePreviewBefore.has(key)) {
+          this.stylePreviewBefore.set(
+            key,
+            inlineDeclaration(element, declaration.property)
+          );
+        }
+        if (declaration.value === "") {
+          element.style.removeProperty(declaration.property);
+        } else {
+          element.style.setProperty(
+            declaration.property,
+            declaration.value,
+            declaration.priority
+          );
+        }
+      }
+    }
+    // Preview changes should be visible immediately without emitting a new
+    // selection snapshot, which would remount the active form control.
+    this.updateOverlay();
+  }
+
+  private commitStylePreview(
+    declarations: Array<Pick<StyleDeclaration, "property" | "value" | "priority">>
+  ): void {
+    const elements = this.selectionElements();
+    const nodes: Extract<CommandPayload, { type: "styles.set" }>["nodes"] = [];
+    for (const element of elements) {
+      const nodeId = idOf(element);
+      const before: StyleDeclaration[] = [];
+      for (const declaration of declarations) {
+        const key = `${nodeId}\u0000${declaration.property}`;
+        before.push(
+          this.stylePreviewBefore.get(key)
+            ?? inlineDeclaration(element, declaration.property)
+        );
+        this.stylePreviewBefore.delete(key);
+        if (declaration.value === "") {
+          element.style.removeProperty(declaration.property);
+        } else {
+          element.style.setProperty(
+            declaration.property,
+            declaration.value,
+            declaration.priority
+          );
+        }
+      }
+      const after = declarations.map(({ property }) =>
+        inlineDeclaration(element, property)
+      );
+      if (JSON.stringify(before) !== JSON.stringify(after)) {
+        nodes.push({ nodeId, before, after });
+      }
+    }
+    if (nodes.length > 0) this.commit({ type: "styles.set", nodes });
+    this.emitSelection();
+  }
+
+  private cancelStylePreview(): void {
+    for (const [key, before] of this.stylePreviewBefore) {
+      const separator = key.indexOf("\u0000");
+      if (separator < 0) continue;
+      const nodeId = key.slice(0, separator);
+      const property = key.slice(separator + 1);
+      const element = this.findNodeById(nodeId);
+      if (!element) continue;
+      if (!before.existed || before.value === "") {
+        element.style.removeProperty(property);
+      } else {
+        element.style.setProperty(
+          property,
+          before.value,
+          before.priority
+        );
+      }
+    }
+    this.stylePreviewBefore.clear();
+    this.updateOverlay();
+  }
+
+  private reportStylePresets(): void {
+    const grouped = new Map<string, {
+      preset: StylePreset;
+      count: number;
+      firstIndex: number;
+    }>();
+    const elements = [
+      ...document.querySelectorAll<HTMLElement>("body [data-hs-id]")
+    ].slice(0, 5_000);
+    for (const [index, element] of elements.entries()) {
+      if (
+        element.closest("[data-hs-overlay]")
+        || element.matches("script,style,canvas,svg,video,iframe")
+      ) continue;
+      const rect = element.getBoundingClientRect();
+      if (rect.width < 12 || rect.height < 8) continue;
+      const computed = getComputedStyle(element);
+      if (computed.display === "none" || computed.visibility === "hidden") {
+        continue;
+      }
+      const target = styleTargetForElement(element);
+      const captured = declarationsForPreset(computed, target);
+      const declarations = this.meaningfulPresetDeclarations(
+        target,
+        captured
+      );
+      if (declarations.length === 0) continue;
+      const signature = `${target}|${presetSignature(declarations)}`;
+      const existing = grouped.get(signature);
+      if (existing) {
+        existing.count += 1;
+        existing.preset.usageCount = existing.count;
+        continue;
+      }
+      const category = this.stylePresetCategory(target);
+      const sampleText = (element.textContent ?? "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 32);
+      const preset: StylePreset = {
+        id: `document-${target}-${index}-${this.hashPresetSignature(signature)}`,
+        name: sampleText
+          ? `${category} · ${sampleText.slice(0, 14)}`
+          : `${category}样式`,
+        category,
+        target,
+        source: "document",
+        declarations,
+        ...(sampleText ? { sampleText } : {}),
+        usageCount: 1
+      };
+      grouped.set(signature, { preset, count: 1, firstIndex: index });
+    }
+    const presets = [...grouped.values()]
+      .sort((left, right) =>
+        right.count - left.count || left.firstIndex - right.firstIndex
+      )
+      .slice(0, 48)
+      .map(({ preset }) => preset);
+    postToHost({ type: "style-presets", presets });
+  }
+
+  private meaningfulPresetDeclarations(
+    target: StylePresetTarget,
+    declarations: StylePreset["declarations"]
+  ): StylePreset["declarations"] {
+    const defaults = new Set([
+      "none",
+      "normal",
+      "auto",
+      "0px",
+      "rgba(0, 0, 0, 0)",
+      "transparent",
+      "1"
+    ]);
+    if (target === "text") {
+      return declarations.filter(({ property, value }) =>
+        !(
+          ["background-color", "border-left", "border-radius", "padding"]
+            .includes(property)
+          && defaults.has(value)
+        )
+      );
+    }
+    const visualProperties = new Set([
+      "background-color",
+      "background-image",
+      "border",
+      "border-radius",
+      "box-shadow",
+      "filter",
+      "object-fit",
+      "padding"
+    ]);
+    const visual = declarations.filter(({ property, value }) => {
+      if (!visualProperties.has(property)) return false;
+      if (defaults.has(value)) return false;
+      if (
+        property === "border"
+        && (value.startsWith("0px ") || value.includes(" none "))
+      ) return false;
+      if (property === "padding" && /^0px(?: 0px){0,3}$/.test(value)) {
+        return false;
+      }
+      return true;
+    });
+    if (visual.length === 0 && !["button", "table"].includes(target)) {
+      return [];
+    }
+    return declarations.filter(({ property, value }) =>
+      !defaults.has(value)
+      || property === "color"
+      || property.startsWith("font-")
+    );
+  }
+
+  private stylePresetCategory(target: StylePresetTarget): string {
+    return {
+      text: "文字",
+      surface: "卡片",
+      image: "图片",
+      button: "按钮",
+      table: "表格"
+    }[target];
+  }
+
+  private hashPresetSignature(value: string): string {
+    let hash = 2_166_136_261;
+    for (let index = 0; index < value.length; index += 1) {
+      hash ^= value.charCodeAt(index);
+      hash = Math.imul(hash, 16_777_619);
+    }
+    return (hash >>> 0).toString(36);
+  }
+
   private setText(text: string): void {
-    if (!this.primary || this.primary.tagName === "IMG") return;
+    if (!this.primary || !canEditPlainText(this.primary)) return;
     const before = this.primary.textContent ?? "";
     if (before === text) return;
     // Replace all text content including child text nodes
@@ -1064,6 +2321,37 @@ class EditorRuntime {
       before,
       after: text
     });
+    this.emitSelection();
+  }
+
+  private previewText(text: string): void {
+    if (!this.primary || !canEditPlainText(this.primary)) return;
+    const nodeId = idOf(this.primary);
+    if (!this.textPreviewBefore.has(nodeId)) {
+      this.textPreviewBefore.set(nodeId, this.primary.textContent ?? "");
+    }
+    if (this.primary.textContent !== text) {
+      this.primary.textContent = text;
+      this.updateOverlay();
+    }
+  }
+
+  private commitTextPreview(text: string): void {
+    if (!this.primary || !canEditPlainText(this.primary)) return;
+    const nodeId = idOf(this.primary);
+    const before = this.textPreviewBefore.get(nodeId)
+      ?? this.primary.textContent
+      ?? "";
+    this.textPreviewBefore.delete(nodeId);
+    if (this.primary.textContent !== text) this.primary.textContent = text;
+    if (before !== text) {
+      this.commit({
+        type: "text.set",
+        nodeId,
+        before,
+        after: text
+      });
+    }
     this.emitSelection();
   }
 
@@ -1096,44 +2384,67 @@ class EditorRuntime {
   ): Extract<CommandPayload, { type: "styles.set" }>["nodes"] | null {
     const rects = elements.map((element) => element.getBoundingClientRect());
     const parentRect = parent.getBoundingClientRect();
-    const parentStyle = getComputedStyle(parent);
     const changes: Extract<CommandPayload, { type: "styles.set" }>["nodes"] = [];
-    if (parentStyle.position === "static") {
-      const before = inlineDeclaration(parent, "position");
-      parent.style.position = "relative";
-      changes.push({
-        nodeId: idOf(parent),
-        before: [before],
-        after: [explicitDeclaration("position", "relative")]
-      });
-    }
+    const parentStyle = getComputedStyle(parent);
     elements.forEach((element, index) => {
       const rect = rects[index]!;
-      const before = GEOMETRY_PROPERTIES.map((property) =>
+      const computed = getComputedStyle(element);
+      const outOfFlow = ["absolute", "fixed"].includes(computed.position);
+      const geometryBefore = GEOMETRY_PROPERTIES.map((property) =>
         inlineDeclaration(element, property)
       );
-      const declarations = [
-        explicitDeclaration("position", "absolute"),
-        explicitDeclaration(
-          "left",
-          `${rect.left - parentRect.left
+      const markerBefore = inlineDeclaration(element, FREE_ORIGIN_PROPERTY);
+      const existingOrigin = element.style.getPropertyValue(
+        FREE_ORIGIN_PROPERTY
+      );
+      const decodedOrigin = existingOrigin
+        ? decodeFreeOrigin(existingOrigin)
+        : null;
+      const completeOrigin = decodedOrigin
+        ? [
+          ...decodedOrigin,
+          ...geometryBefore.filter((declaration) =>
+            !decodedOrigin.some((entry) =>
+              entry.property === declaration.property
+            )
+          )
+        ]
+        : geometryBefore;
+      const origin = encodeFreeOrigin(completeOrigin);
+      const left = outOfFlow
+        ? computed.left !== "auto"
+          ? computed.left
+          : `${rect.left - parentRect.left
             - (parseFloat(parentStyle.borderLeftWidth) || 0)
             + parent.scrollLeft}px`
-        ),
-        explicitDeclaration(
-          "top",
-          `${rect.top - parentRect.top
+        : computed.position === "relative" && computed.left !== "auto"
+          ? computed.left
+          : "0px";
+      const top = outOfFlow
+        ? computed.top !== "auto"
+          ? computed.top
+          : `${rect.top - parentRect.top
             - (parseFloat(parentStyle.borderTopWidth) || 0)
             + parent.scrollTop}px`
-        ),
-        explicitDeclaration("width", `${rect.width}px`),
-        explicitDeclaration("height", `${rect.height}px`),
-        explicitDeclaration("margin", "0px")
+        : computed.position === "relative" && computed.top !== "auto"
+          ? computed.top
+          : "0px";
+      const declarations = [
+        explicitDeclaration("position", outOfFlow ? computed.position : "relative"),
+        explicitDeclaration("left", left),
+        explicitDeclaration("right", "auto"),
+        explicitDeclaration("top", top),
+        explicitDeclaration("bottom", "auto"),
+        explicitDeclaration(FREE_ORIGIN_PROPERTY, origin)
       ];
       for (const declaration of declarations) {
         element.style.setProperty(declaration.property, declaration.value);
       }
-      changes.push({ nodeId: idOf(element), before, after: declarations });
+      changes.push({
+        nodeId: idOf(element),
+        before: [...geometryBefore, markerBefore],
+        after: declarations
+      });
     });
     return changes;
   }
@@ -1152,10 +2463,141 @@ class EditorRuntime {
     });
   }
 
+  private toggleFreeMovement(): void {
+    const elements = this.selectionElements().filter(
+      (element) => element !== document.body
+    );
+    if (elements.length === 0) return;
+    const enabled = elements.every(
+      (element) =>
+        element.style.getPropertyValue(FREE_ORIGIN_PROPERTY) !== ""
+    );
+    if (!enabled) {
+      const pending = elements.filter(
+        (element) =>
+          element.style.getPropertyValue(FREE_ORIGIN_PROPERTY) === ""
+      );
+      const changes = this.freeGeometryChanges(pending);
+      if (!changes) return;
+      this.commit({ type: "styles.set", nodes: changes });
+      this.emitSelection();
+      postToHost({
+        type: "notice",
+        message: `${pending.length} 个对象已开启自由移动`
+      });
+      return;
+    }
+
+    const changes: Extract<
+      CommandPayload,
+      { type: "styles.set" }
+    >["nodes"] = [];
+    const parents = new Set<HTMLElement>();
+    for (const element of elements) {
+      const origin = decodeFreeOrigin(
+        element.style.getPropertyValue(FREE_ORIGIN_PROPERTY)
+      );
+      if (!origin) continue;
+      const before = [
+        ...GEOMETRY_PROPERTIES.map((property) =>
+          inlineDeclaration(element, property)
+        ),
+        inlineDeclaration(element, FREE_ORIGIN_PROPERTY)
+      ];
+      const after = [
+        ...origin,
+        {
+          property: FREE_ORIGIN_PROPERTY,
+          value: "",
+          priority: "" as const,
+          existed: false
+        }
+      ];
+      applyStyleDeclarations(element, after);
+      changes.push({ nodeId: idOf(element), before, after });
+      if (element.parentElement) parents.add(element.parentElement);
+    }
+    for (const parent of parents) {
+      const hasFreeChild = [...parent.children].some(
+        (child) =>
+          child instanceof HTMLElement
+          && child.style.getPropertyValue(FREE_ORIGIN_PROPERTY) !== ""
+      );
+      if (hasFreeChild) continue;
+      const marker = parent.style.getPropertyValue(
+        FREE_CONTAINER_ORIGIN_PROPERTY
+      );
+      const origin = decodeFreeOrigin(marker);
+      if (!origin) continue;
+      const before = [
+        ...origin.map((declaration) =>
+          inlineDeclaration(parent, declaration.property)
+        ),
+        inlineDeclaration(parent, FREE_CONTAINER_ORIGIN_PROPERTY)
+      ];
+      const after = [
+        ...origin,
+        {
+          property: FREE_CONTAINER_ORIGIN_PROPERTY,
+          value: "",
+          priority: "" as const,
+          existed: false
+        }
+      ];
+      applyStyleDeclarations(parent, after);
+      changes.push({
+        nodeId: persistedIdOf(parent),
+        before,
+        after
+      });
+    }
+    if (changes.length === 0) return;
+    this.commit({ type: "styles.set", nodes: changes });
+    this.emitSelection();
+    postToHost({
+      type: "notice",
+      message: `${elements.length} 个对象已恢复原文档布局`
+    });
+  }
+
   private alignSelection(alignment: Alignment): void {
-    const elements = this.selectionElements();
+    const normalized = this.normalizeObjectSelection(
+      this.selectionElements()
+    );
+    this.replaceSelection(normalized);
+    const elements = normalized.filter(
+      (element) => element !== document.body
+    );
     if (elements.length < 2) {
       postToHost({ type: "notice", message: "请用 Shift 或 Ctrl 选择至少两个对象" });
+      return;
+    }
+    const parent = elements[0]?.parentElement ?? null;
+    if (
+      !parent
+      || elements.some((element) => element.parentElement !== parent)
+    ) {
+      postToHost({
+        type: "notice",
+        message: "只能对齐同一容器中的同级对象；请改选卡片外框或同一组元素"
+      });
+      return;
+    }
+    if (elements.some((element) => {
+      const rect = element.getBoundingClientRect();
+      return rect.width <= 0 || rect.height <= 0;
+    })) {
+      postToHost({
+        type: "notice",
+        message: "选区中包含不可见对象，无法安全对齐"
+      });
+      return;
+    }
+    if (elements.length > 100) {
+      postToHost({
+        type: "notice",
+        message: "一次最多对齐 100 个对象，请缩小选区"
+      });
       return;
     }
     // Capture viewport-space boxes BEFORE freeGeometryChanges modifies styles,
@@ -1254,6 +2696,390 @@ class EditorRuntime {
     postToHost({ type: "notice", message: "已在选中元素内插入图片" });
   }
 
+  private acceptImages(
+    images: Array<{ path: string; title: string }>
+  ): void {
+    const slots = this.selectedImageSlots.filter(
+      (candidate) => candidate.container.isConnected
+    );
+    if (slots.length === 0) {
+      postToHost({
+        type: "notice",
+        message: "请先点击“选择图片槽”，再在画布中点选需要填充的位置"
+      });
+      return;
+    }
+
+    const count = Math.min(images.length, slots.length);
+    const htmlChanges: Array<{
+      nodeId: string;
+      before: string;
+      after: string;
+    }> = [];
+    const attributeChanges: Array<{
+      nodeId: string;
+      name: string;
+      before: string | null;
+      after: string | null;
+    }> = [];
+    const styleChanges: Array<{
+      nodeId: string;
+      before: StyleDeclaration[];
+      after: StyleDeclaration[];
+    }> = [];
+    for (let index = 0; index < count; index++) {
+      const slot = slots[index]!;
+      const image = images[index]!;
+      if (slot.kind === "image" && slot.image) {
+        const target = slot.image;
+        const before = target.getAttribute("src");
+        target.setAttribute("src", image.path);
+        attributeChanges.push({
+          nodeId: idOf(target),
+          name: "src",
+          before,
+          after: image.path
+        });
+        if (target.hasAttribute("srcset")) {
+          const srcset = target.getAttribute("srcset");
+          target.removeAttribute("srcset");
+          attributeChanges.push({
+            nodeId: idOf(target),
+            name: "srcset",
+            before: srcset,
+            after: null
+          });
+        }
+        const picture = target.parentElement?.matches("picture")
+          ? target.parentElement
+          : null;
+        for (const source of picture?.querySelectorAll<HTMLSourceElement>(
+          "source"
+        ) ?? []) {
+          const srcset = source.getAttribute("srcset");
+          if (srcset === null) continue;
+          source.removeAttribute("srcset");
+          attributeChanges.push({
+            nodeId: idOf(source),
+            name: "srcset",
+            before: srcset,
+            after: null
+          });
+        }
+        continue;
+      }
+      if (slot.kind === "background") {
+        const before = inlineDeclaration(slot.container, "background-image");
+        const current = getComputedStyle(slot.container).backgroundImage;
+        const replacement = `url("${image.path}")`;
+        const next = current.includes("url(")
+          ? current.replace(
+            /url\((?:"[^"]*"|'[^']*'|[^)]*)\)/,
+            replacement
+          )
+          : replacement;
+        const after = explicitDeclaration(
+          "background-image",
+          next
+        );
+        slot.container.style.setProperty(after.property, after.value);
+        styleChanges.push({
+          nodeId: idOf(slot.container),
+          before: [before],
+          after: [after]
+        });
+        continue;
+      }
+      const before = slot.container.innerHTML;
+      const element = document.createElement("img");
+      element.src = image.path;
+      element.alt = image.title || `批量导入图片 ${index + 1}`;
+      element.draggable = false;
+      element.loading = "lazy";
+      Object.assign(element.style, {
+        display: "block",
+        width: "100%",
+        height: "100%",
+        objectFit: "contain"
+      });
+      slot.container.replaceChildren(element);
+      htmlChanges.push({
+        nodeId: idOf(slot.container),
+        before,
+        after: slot.container.innerHTML
+      });
+    }
+    if (
+      htmlChanges.length === 0
+      && attributeChanges.length === 0
+      && styleChanges.length === 0
+    ) return;
+    this.commit({
+      type: "component.update",
+      texts: [],
+      html: htmlChanges,
+      styles: styleChanges,
+      attributes: attributeChanges
+    });
+    this.setSelection(slots[count - 1]!.container);
+    const extraImages = images.length - count;
+    const remainingSlots = slots.length - count;
+    this.clearImageSlotSelection();
+    postToHost({
+      type: "notice",
+      message: `已按点选顺序嵌入 ${count} 张图片`
+        + (extraImages > 0 ? `，${extraImages} 张因没有对应已选槽位而跳过` : "")
+        + (remainingSlots > 0 ? `，还有 ${remainingSlots} 个已选槽位未填充` : "")
+    });
+  }
+
+  private selectImageSlots(mode: "toggle" | "all" | "clear"): void {
+    if (mode === "clear") {
+      this.clearImageSlotSelection();
+      return;
+    }
+    if (mode === "toggle" && this.imageSlotSelectionMode) {
+      this.imageSlotSelectionMode = false;
+      this.renderImageSlotOverlays();
+      this.emitImageSlotSelection();
+      return;
+    }
+    this.imageSlotCandidates = this.detectImageSlots();
+    this.imageSlotSelectionMode = true;
+    if (mode === "all") {
+      this.selectedImageSlots = [...this.imageSlotCandidates];
+    } else {
+      this.selectedImageSlots = this.selectedImageSlots.filter((selected) =>
+        this.imageSlotCandidates.some(
+          (candidate) => candidate.container === selected.container
+        )
+      );
+    }
+    this.renderImageSlotOverlays();
+    this.emitImageSlotSelection();
+    postToHost({
+      type: "notice",
+      message: this.imageSlotCandidates.length > 0
+        ? `识别到 ${this.imageSlotCandidates.length} 个候选图片槽；请按希望的填充顺序点击`
+        : "当前页面未识别到可替换的图片槽"
+    });
+  }
+
+  private clearImageSlotSelection(): void {
+    this.imageSlotSelectionMode = false;
+    this.imageSlotCandidates = [];
+    this.selectedImageSlots = [];
+    this.imageSlotOverlay?.remove();
+    this.imageSlotOverlay = null;
+    this.emitImageSlotSelection();
+  }
+
+  private detectImageSlots(): ImageSlotCandidate[] {
+    const candidates = new Map<HTMLElement, ImageSlotCandidate>();
+    const semanticPattern =
+      /(?:image|img|photo|picture|media|visual|thumbnail|thumb|screenshot|upload)[-_ ]*(?:slot|placeholder|frame|box|wrap|wrapper|container|card)\b|(?:图片|截图|封面)(?:槽|框|占位|容器)/i;
+    const backgroundSemanticPattern =
+      /(?:cover|hero|banner|visual|background|bg|封面|头图|背景)/i;
+    const decorativePattern =
+      /(?:logo|watermark|icon|avatar|badge|emoji|decoration|ornament|qr|二维码|水印|头像|图标)/i;
+    const visibleBox = (element: HTMLElement): boolean => {
+      const style = getComputedStyle(element);
+      if (
+        style.display === "none"
+        || style.visibility === "hidden"
+        || Number(style.opacity) === 0
+      ) return false;
+      const rect = element.getBoundingClientRect();
+      return rect.width >= 48
+        && rect.height >= 48
+        && rect.width * rect.height >= 4_096;
+    };
+    const descriptorOf = (element: HTMLElement): string => [
+      element.id,
+      element.className,
+      element.getAttribute("role") ?? "",
+      element.getAttribute("aria-label") ?? "",
+      element.getAttribute("alt") ?? "",
+      ...element.getAttributeNames().filter((name) =>
+        name.startsWith("data-")
+      )
+    ].join(" ");
+    const isDecorative = (element: HTMLElement): boolean =>
+      decorativePattern.test(descriptorOf(element));
+    const add = (
+      container: HTMLElement,
+      kind: ImageSlotCandidate["kind"],
+      image?: HTMLImageElement
+    ): void => {
+      if (
+        container.closest("[data-hs-overlay]")
+        || !visibleBox(container)
+        || isDecorative(container)
+        || (image && isDecorative(image))
+      ) return;
+      candidates.set(container, {
+        container,
+        kind,
+        ...(image ? { image } : {})
+      });
+    };
+
+    for (const element of document.querySelectorAll<HTMLElement>("body *")) {
+      if (element.matches("script, style, canvas, svg, video, iframe")) continue;
+      const descriptor = descriptorOf(element);
+      const image = element instanceof HTMLImageElement
+        ? element
+        : element.querySelector<HTMLImageElement>(
+          ":scope > img, :scope > picture img"
+        );
+      const hasGenericDataSlot = element.hasAttribute("data-slot")
+        && Boolean(
+          image
+          || semanticPattern.test(descriptor)
+          || /上传|替换|图片|截图|封面/.test(element.textContent ?? "")
+        );
+      const hasImageBackground =
+        getComputedStyle(element).backgroundImage.includes("url(");
+      if (
+        semanticPattern.test(descriptor)
+        || hasGenericDataSlot
+        || (
+          hasImageBackground
+          && backgroundSemanticPattern.test(descriptor)
+        )
+      ) {
+        if (image) {
+          add(element, "image", image);
+        } else if (hasImageBackground) {
+          add(element, "background");
+        } else {
+          add(element, "container");
+        }
+      }
+    }
+
+    for (const image of document.querySelectorAll<HTMLImageElement>("img")) {
+      if (
+        [...candidates.values()].some(
+          (candidate) =>
+            candidate.image === image || candidate.container.contains(image)
+        )
+      ) continue;
+      add(image, "image", image);
+    }
+
+    return [...candidates.values()].sort((left, right) => {
+      if (left.container === right.container) return 0;
+      return left.container.compareDocumentPosition(right.container)
+        & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+    });
+  }
+
+  private findImageSlotCandidate(
+    target: Element
+  ): ImageSlotCandidate | undefined {
+    return this.imageSlotCandidates
+      .filter((candidate) =>
+        candidate.container === target || candidate.container.contains(target)
+      )
+      .sort((left, right) =>
+        left.container.contains(right.container) ? 1 : -1
+      )[0];
+  }
+
+  private refreshImageSlotCandidates(): void {
+    const selectedContainers = new Set(
+      this.selectedImageSlots
+        .filter((candidate) => candidate.container.isConnected)
+        .map((candidate) => candidate.container)
+    );
+    this.imageSlotCandidates = this.detectImageSlots();
+    this.selectedImageSlots = this.imageSlotCandidates.filter((candidate) =>
+      selectedContainers.has(candidate.container)
+    );
+  }
+
+  private toggleImageSlotCandidate(candidate: ImageSlotCandidate): void {
+    const selectedIndex = this.selectedImageSlots.findIndex(
+      (selected) => selected.container === candidate.container
+    );
+    if (selectedIndex >= 0) {
+      this.selectedImageSlots.splice(selectedIndex, 1);
+    } else {
+      this.selectedImageSlots.push(candidate);
+    }
+  }
+
+  private renderImageSlotOverlays(): void {
+    this.imageSlotOverlay?.remove();
+    this.imageSlotOverlay = null;
+    const shown = this.imageSlotSelectionMode
+      ? this.imageSlotCandidates
+      : this.selectedImageSlots;
+    if (shown.length === 0) return;
+    const root = document.createElement("div");
+    root.dataset.hsOverlay = "image-slots";
+    Object.assign(root.style, {
+      position: "fixed",
+      inset: "0",
+      pointerEvents: "none",
+      zIndex: "2147483646"
+    });
+    for (const candidate of shown) {
+      if (!candidate.container.isConnected) continue;
+      const rect = candidate.container.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) continue;
+      const selectedIndex = this.selectedImageSlots.indexOf(candidate);
+      const marker = document.createElement("div");
+      Object.assign(marker.style, {
+        position: "fixed",
+        left: `${rect.left}px`,
+        top: `${rect.top}px`,
+        width: `${rect.width}px`,
+        height: `${rect.height}px`,
+        boxSizing: "border-box",
+        border: selectedIndex >= 0
+          ? "4px solid #16a34a"
+          : "3px dashed #2563eb",
+        background: selectedIndex >= 0
+          ? "rgba(22,163,74,.12)"
+          : "rgba(37,99,235,.06)",
+        borderRadius: "6px"
+      });
+      if (selectedIndex >= 0) {
+        const badge = document.createElement("span");
+        badge.textContent = String(selectedIndex + 1);
+        Object.assign(badge.style, {
+          position: "absolute",
+          left: "-4px",
+          top: "-28px",
+          minWidth: "28px",
+          height: "28px",
+          padding: "0 7px",
+          borderRadius: "14px",
+          background: "#16a34a",
+          color: "#fff",
+          font: "700 14px/28px sans-serif",
+          textAlign: "center",
+          boxShadow: "0 2px 8px rgba(0,0,0,.2)"
+        });
+        marker.appendChild(badge);
+      }
+      root.appendChild(marker);
+    }
+    document.body.appendChild(root);
+    this.imageSlotOverlay = root;
+  }
+
+  private emitImageSlotSelection(): void {
+    postToHost({
+      type: "image-slot-selection",
+      active: this.imageSlotSelectionMode,
+      candidates: this.imageSlotCandidates.length,
+      selected: this.selectedImageSlots.length
+    });
+  }
+
   /** Insert a new <img> element as a child of the given parent. */
   private insertImageIntoElement(parent: HTMLElement, path: string): void {
     const img = document.createElement("img");
@@ -1330,23 +3156,35 @@ class EditorRuntime {
   private deleteSelected(): void {
     const elements = this.selectionElements();
     if (elements.length === 0) return;
+    const protectedIds = new Set(
+      elements.flatMap((element) => this.scriptMountIdsWithin(element))
+    );
+    if (protectedIds.size > 0) {
+      postToHost({
+        type: "notice",
+        message:
+          `无法删除：页面脚本仍依赖 ${[...protectedIds].slice(0, 3).map(
+            (id) => `#${id}`
+          ).join("、")}${protectedIds.size > 3 ? " 等节点" : ""}`
+      });
+      return;
+    }
     for (const element of elements) {
       const parent = element.parentElement;
       if (!parent?.isConnected) continue;
       const index = [...parent.children].indexOf(element);
-      const tagName = element.tagName.toLowerCase() as "img" | "div" | "p" | "span";
+      const tagName = element.tagName.toLowerCase();
       const attributes: Record<string, string> = {};
-      const style = element.getAttribute("style");
-      if (style) attributes.style = style;
-      if (tagName === "img" && element instanceof HTMLImageElement) {
-        attributes.src = element.src;
-        attributes.alt = element.alt || "";
+      for (const attribute of [...element.attributes]) {
+        if (attribute.name !== "data-hs-id") {
+          attributes[attribute.name] = attribute.value;
+        }
       }
       element.remove();
       this.commit({
         type: "node.delete",
         nodeId: idOf(element),
-        parentId: idOf(parent),
+        parentId: persistedIdOf(parent),
         index,
         node: {
           id: idOf(element),
@@ -1361,21 +3199,42 @@ class EditorRuntime {
     postToHost({ type: "notice", message: `已删除 ${elements.length} 个对象` });
   }
 
+  private scriptMountIdsWithin(element: HTMLElement): string[] {
+    const referenced = new Set<string>();
+    for (const script of [...document.scripts]) {
+      const source = script.textContent ?? "";
+      for (const match of source.matchAll(
+        /getElementById\s*\(\s*(['"])([^'"]+)\1\s*\)/g
+      )) {
+        if (match[2]) referenced.add(match[2]);
+      }
+      for (const match of source.matchAll(
+        /querySelector(?:All)?\s*\(\s*(['"])\s*#([A-Za-z][\w:.-]*)\1\s*\)/g
+      )) {
+        if (match[2]) referenced.add(match[2]);
+      }
+    }
+    const containedIds = [
+      ...(element.id ? [element.id] : []),
+      ...[...element.querySelectorAll<HTMLElement>("[id]")]
+        .map((candidate) => candidate.id)
+        .filter(Boolean)
+    ];
+    return containedIds.filter((id) => referenced.has(id));
+  }
+
   private copySelected(): void {
     const elements = this.selectionElements();
     if (elements.length === 0) return;
     try {
       const snapshots = elements.map((element) => {
-        const tag = element.tagName.toLowerCase() as "img" | "div" | "p" | "span";
+        const tag = element.tagName.toLowerCase();
         const attrs: Record<string, string> = {};
-        const style = element.getAttribute("style");
-        if (style) attrs.style = style;
-        if (tag === "img" && element instanceof HTMLImageElement) {
-          attrs.src = element.src;
-          attrs.alt = element.alt || "";
+        for (const attribute of [...element.attributes]) {
+          if (attribute.name !== "data-hs-id") {
+            attrs[attribute.name] = attribute.value;
+          }
         }
-        if (element.id) attrs.id = element.id;
-        if (element.className) attrs.className = element.className;
         // Don't carry dyn_ ids to the paste — they'll get new ids
         const nodeId = idOf(element);
         const persistentId = isDynamicId(nodeId) ? null : nodeId;
@@ -1402,7 +3261,7 @@ class EditorRuntime {
   private pasteClipboard(data: string): void {
     try {
       const snapshots = JSON.parse(data) as Array<{
-        tagName: "img" | "div" | "p" | "span";
+        tagName: string;
         attributes: Record<string, string>;
         text: string;
         hsId: string | null;
@@ -1424,7 +3283,7 @@ class EditorRuntime {
         parent.appendChild(element);
         this.commit({
           type: "node.insert",
-          parentId: idOf(parent),
+          parentId: persistedIdOf(parent),
           index: parent.children.length - 1,
           node: {
             id,
@@ -1467,20 +3326,37 @@ class EditorRuntime {
     if (!this.primary) return;
     const source = this.primary;
     const clone = source.cloneNode(true) as HTMLElement;
-    const newId = `node_${crypto.randomUUID()}`;
-    clone.dataset.hsId = newId;
-    clone.removeAttribute("contenteditable");
-    clone.removeAttribute("data-hs-dyn-patches");
-    clone.removeAttribute("data-hs-chart-stable-id");
+    for (const candidate of [
+      clone,
+      ...clone.querySelectorAll<HTMLElement>("[data-hs-id]")
+    ]) {
+      candidate.dataset.hsId = `node_${crypto.randomUUID()}`;
+      candidate.removeAttribute("contenteditable");
+      candidate.removeAttribute("data-hs-dyn-patches");
+      candidate.removeAttribute("data-hs-chart-stable-id");
+      candidate.classList.remove("hs-hover-outline");
+    }
+    const newId = clone.dataset.hsId!;
     source.parentElement?.insertBefore(clone, source.nextSibling);
-    const parent = source.parentElement!;
-    const index = [...parent.children].indexOf(clone);
-    this.commit({
-      type: "node.insert",
-      parentId: idOf(parent),
-      index: index >= 0 ? index : parent.children.length - 1,
-      node: { id: newId, tagName: (["img","div","p","span"].includes(source.tagName.toLowerCase()) ? source.tagName.toLowerCase() : "div") as "img"|"div"|"p"|"span", attributes: {}, text: "" }
-    });
+      const parent = source.parentElement!;
+      const index = [...parent.children].indexOf(clone);
+      const attributes: Record<string, string> = {};
+      for (const attribute of [...clone.attributes]) {
+        if (attribute.name !== "data-hs-id") {
+          attributes[attribute.name] = attribute.value;
+        }
+      }
+      this.commit({
+        type: "node.insert",
+        parentId: persistedIdOf(parent),
+        index: index >= 0 ? index : parent.children.length - 1,
+        node: {
+          id: newId,
+          tagName: source.tagName.toLowerCase(),
+          attributes,
+          text: clone.innerHTML
+        }
+      });
     this.setSelection(clone);
     postToHost({ type: "notice", message: "已克隆" });
   }
@@ -1495,12 +3371,11 @@ class EditorRuntime {
       after: StyleDeclaration[];
     }> = [];
     for (const el of elements) {
-      const computed = getComputedStyle(el);
-      if (!["absolute", "fixed"].includes(computed.position)) continue;
+      if (el.style.getPropertyValue(FREE_ORIGIN_PROPERTY) === "") continue;
       const beforeLeft = inlineDeclaration(el, "left");
       const beforeTop = inlineDeclaration(el, "top");
-      const newLeft = parseFloat(computed.left) + dx;
-      const newTop = parseFloat(computed.top) + dy;
+      const newLeft = (parseFloat(el.style.left) || 0) + dx;
+      const newTop = (parseFloat(el.style.top) || 0) + dy;
       el.style.left = `${newLeft}px`;
       el.style.top = `${newTop}px`;
       nodes.push({
@@ -1516,6 +3391,15 @@ class EditorRuntime {
       this.commit({ type: "styles.set", nodes });
       // Propagate to symbol instances
       this.propagateSymbolChanges(nodes);
+      postToHost({
+        type: "notice",
+        message: `已移动 ${nodes.length} 个对象`
+      });
+    } else {
+      postToHost({
+        type: "notice",
+        message: "请先开启自由移动"
+      });
     }
     this.emitSelection();
   }
@@ -1597,12 +3481,15 @@ class EditorRuntime {
     this.setSelection(siblings[nextIdx]!);
   }
 
-  /** GrapesJS BlockManager: insert a pre-built block into the page. */
-  private insertBlock(blockType: string): void {
+  /** Insert a block either into document flow or as a free-positioned object. */
+  private insertBlock(
+    blockType: string,
+    placement: "flow" | "free"
+  ): void {
     try {
       const BLOCKS: Record<string, () => HTMLElement> = {
         h1: () => { const el = document.createElement("h1"); el.textContent = "标题一"; el.style.cssText = "min-height:24px;margin:8px 0;color:inherit"; return el; },
-        h2: () => { const el = document.createElement("h2"); el.textContent = "标题���"; el.style.cssText = "min-height:20px;margin:8px 0;color:inherit"; return el; },
+        h2: () => { const el = document.createElement("h2"); el.textContent = "标题二"; el.style.cssText = "min-height:20px;margin:8px 0;color:inherit"; return el; },
         h3: () => { const el = document.createElement("h3"); el.textContent = "标题三"; el.style.cssText = "min-height:18px;margin:8px 0;color:inherit"; return el; },
         p: () => { const el = document.createElement("p"); el.textContent = "正文段落，双击编辑文字内容。"; el.style.cssText = "min-height:18px;margin:8px 0;color:inherit"; return el; },
         card: () => {
@@ -1677,11 +3564,20 @@ class EditorRuntime {
           return el;
         },
         video: () => {
-          // Video placeholder — user can replace via image import flow
-          const el = document.createElement("div");
+          const el = document.createElement("video");
           el.dataset.hsVideo = "placeholder";
-          el.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;min-height:160px;border:1px dashed #4f7cff80;border-radius:6px;background:#f8faff;color:#4f7cff;font-size:13px;">▶ 视频占位 — 双击替换</div>';
-          Object.assign(el.style, { minHeight: "160px", margin: "8px 0" });
+          el.controls = true;
+          el.preload = "metadata";
+          el.setAttribute("aria-label", "视频占位，选择后从右侧导入视频");
+          Object.assign(el.style, {
+            display: "block",
+            width: "100%",
+            minHeight: "180px",
+            margin: "8px 0",
+            border: "1px dashed #4f7cff80",
+            borderRadius: "6px",
+            background: "#111827"
+          });
           return el;
         }
       };
@@ -1692,43 +3588,35 @@ class EditorRuntime {
       const el = factory();
       const nodeId = `node_${crypto.randomUUID()}`;
       el.dataset.hsId = nodeId;
-      // Phase 12: default absolute positioning for free-form editing (GrapesJS pattern)
-      if (!el.style.cssText.includes("position")) {
+      if (placement === "free" && !el.style.cssText.includes("position")) {
         const scrollY = window.scrollY;
         el.style.cssText += `;position:absolute;left:20px;top:${scrollY + 40}px;min-width:120px;min-height:28px;z-index:10;background:rgba(255,255,255,0.95);box-shadow:0 1px 4px rgba(0,0,0,0.08);border-radius:4px`;
-      }
-      // Make freshly-inserted blocks stand out: left highlight + padding
-      const hasExplicitStyle = el.hasAttribute("style") && el.style.cssText.length > 50;
-      if (!hasExplicitStyle) {
-        el.style.cssText += ";min-height:20px;margin:4px 0;padding:4px 0;border-left:3px solid rgba(79,124,255,0.3);padding-left:8px";
       }
 
       let parent: HTMLElement;
       let ref: Node | null = null;
-      if (this.primary?.isConnected && this.primary.parentElement
-          && this.primary.parentElement !== document.body) {
-        parent = this.primary.parentElement;
-        ref = this.primary.nextSibling;
-      } else {
-        // GrapesJS-style: find a meaningful container, NEVER body
-        const pageInner = document.querySelector<HTMLElement>(".page-inner");
-        const page = document.querySelector<HTMLElement>(".page");
-        if (pageInner) {
-          parent = pageInner;
-        } else if (page) {
-          parent = page;
+      const pageInner = document.querySelector<HTMLElement>(".page-inner");
+      const page = document.querySelector<HTMLElement>(".page");
+      if (placement === "free") {
+        parent = pageInner ?? page ?? document.body;
+      } else if (this.primary?.isConnected) {
+        const containerTags = new Set([
+          "DIV", "SECTION", "ARTICLE", "MAIN", "ASIDE", "HEADER",
+          "FOOTER", "LI", "TD", "FIGURE"
+        ]);
+        if (
+          containerTags.has(this.primary.tagName)
+        ) {
+          // Match component builders such as GrapesJS: a selected container
+          // receives the new component as a child. Dynamic containers are
+          // supported by DynamicNodeManager's local structural freeze.
+          parent = this.primary;
         } else {
-          // Reuse or create a dedicated editor root
-          let root = document.getElementById("hs-canvas-root");
-          if (!root) {
-            root = document.createElement("div");
-            root.id = "hs-canvas-root";
-            root.style.cssText = "min-height: 200px; padding: 16px; box-sizing: border-box;";
-            (document.querySelector("main, #app, .canvas, body")
-              ?? document.body).appendChild(root);
-          }
-          parent = root;
+          parent = this.primary.parentElement ?? pageInner ?? page ?? document.body;
+          ref = this.primary.nextSibling;
         }
+      } else {
+        parent = pageInner ?? page ?? document.body;
       }
       // Ensure parent has id (skip body/html)
       if (parent !== document.body && parent !== document.documentElement
@@ -1741,16 +3629,21 @@ class EditorRuntime {
 
       const index = [...parent.children].indexOf(el);
       const tag = el.tagName.toLowerCase();
-      const validTags = ["img","div","p","span","h1","h2","h3","hr","button"];
+      const attributes: Record<string, string> = {};
+      for (const attribute of [...el.attributes]) {
+        if (attribute.name !== "data-hs-id") {
+          attributes[attribute.name] = attribute.value;
+        }
+      }
       this.commit({
         type: "node.insert",
-        parentId: idOf(parent),
+        parentId: persistedIdOf(parent),
         index: index >= 0 ? index : parent.children.length - 1,
         node: {
           id: nodeId,
-          tagName: (validTags.includes(tag) ? tag : "div") as "img"|"div"|"p"|"span"|"h1"|"h2"|"h3"|"hr"|"button",
-          attributes: { style: el.getAttribute("style") ?? "" },
-          text: tag === "img" ? "" : (el.textContent ?? "")
+          tagName: tag,
+          attributes,
+          text: el.innerHTML
         }
       });
       this.setSelection(el);
@@ -1760,7 +3653,12 @@ class EditorRuntime {
       if (blockType === "chart") {
         window.setTimeout(() => this.initChartElements(), 100);
       }
-      postToHost({ type: "notice", message: `已插入 ${blockType}` });
+      postToHost({
+        type: "notice",
+        message: placement === "flow"
+          ? `已嵌入 ${blockType}`
+          : `已插入自由定位 ${blockType}`
+      });
     } catch (err) {
       console.error("[insertBlock] failed:", err);
       postToHost({ type: "notice", message: "组件插入失败，请重试" });
@@ -1786,6 +3684,16 @@ class EditorRuntime {
       try {
         const raw = el.dataset.hsChartData;
         const config: ChartBlockData = raw ? JSON.parse(raw) : getDefaultChartData();
+        if (!config.style) {
+          const sourceSvg = el.querySelector<SVGSVGElement>("svg");
+          const recoveredStyle = sourceSvg
+            ? styleProfileForSvg(sourceSvg)
+            : undefined;
+          if (recoveredStyle) {
+            config.style = recoveredStyle;
+            el.dataset.hsChartData = JSON.stringify(config);
+          }
+        }
         const inst = e.init(el);
         inst.setOption(buildEChartsOption(config));
         setTimeout(() => inst.resize(), 150);
@@ -1879,30 +3787,54 @@ class EditorRuntime {
 
   /** GrapesJS z-index: delta > 0 = bring forward, delta < 0 = send back */
   private adjustZIndex(delta: number): void {
-    if (!this.primary) return;
-    const current = parseInt(getComputedStyle(this.primary).zIndex, 10) || 0;
-    const before = inlineDeclaration(this.primary, "z-index");
-    const newZ = Math.max(0, current + delta);
-    this.primary.style.zIndex = String(newZ);
-    this.commit({
-      type: "styles.set",
-      nodes: [{ nodeId: idOf(this.primary), before: [before],
-        after: [explicitDeclaration("z-index", String(newZ))] }]
+    const elements = this.selectionElements().filter(
+      (element) =>
+        element.style.getPropertyValue(FREE_ORIGIN_PROPERTY) !== ""
+    );
+    if (elements.length === 0) {
+      postToHost({
+        type: "notice",
+        message: "叠放层级只对自由移动对象生效"
+      });
+      return;
+    }
+    const nodes = elements.map((element) => {
+      const current = Number.parseInt(
+        getComputedStyle(element).zIndex,
+        10
+      ) || 0;
+      const before = inlineDeclaration(element, "z-index");
+      const newZ = Math.max(0, current + delta);
+      element.style.zIndex = String(newZ);
+      return {
+        nodeId: idOf(element),
+        before: [before],
+        after: [explicitDeclaration("z-index", String(newZ))]
+      };
     });
+    this.commit({ type: "styles.set", nodes });
     this.emitSelection();
+    postToHost({
+      type: "notice",
+      message: `${elements.length} 个对象层级已调整`
+    });
   }
 
   /** GrapesJS LayerManager: tree of all [data-hs-id] elements */
   private reportLayers(): void {
     const seen = new Set<string>();
+    let emitted = 0;
+    const maximum = 1_000;
     function walk(el: Element): LayerNode[] {
       const nodes: LayerNode[] = [];
       for (const child of el.children) {
+        if (emitted >= maximum) break;
         if (child instanceof HTMLElement && child.dataset.hsOverlay) continue;
         const id = child instanceof HTMLElement ? child.getAttribute("data-hs-id") : null;
         if (!id) { nodes.push(...walk(child)); continue; }
         if (seen.has(id)) continue;
         seen.add(id);
+        emitted += 1;
         nodes.push({
           id, tag: child.tagName.toLowerCase(),
           text: child.textContent?.trim().slice(0, 40) ?? child.tagName.toLowerCase(),
@@ -1912,7 +3844,7 @@ class EditorRuntime {
       return nodes;
     }
     (postToHost as unknown as (m: Record<string, unknown>) => void)({
-      type: "layers", layers: walk(document.body).slice(0, 200)
+      type: "layers", layers: walk(document.body)
     });
   }
 
@@ -1921,6 +3853,130 @@ class EditorRuntime {
     const html = "<!doctype html>\n" + document.documentElement.outerHTML;
     (postToHost as unknown as (m: Record<string, unknown>) => void)({
       type: "source-code", html
+    });
+  }
+
+  private async waitForDomStability(
+    quietMilliseconds = 400,
+    maximumMilliseconds = 4_000
+  ): Promise<void> {
+    await new Promise<void>((resolve) => {
+      let quietTimer = window.setTimeout(finish, quietMilliseconds);
+      const maximumTimer = window.setTimeout(finish, maximumMilliseconds);
+      const observer = new MutationObserver(() => {
+        window.clearTimeout(quietTimer);
+        quietTimer = window.setTimeout(finish, quietMilliseconds);
+      });
+      function finish(): void {
+        observer.disconnect();
+        window.clearTimeout(quietTimer);
+        window.clearTimeout(maximumTimer);
+        resolve();
+      }
+      observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        characterData: true
+      });
+    });
+  }
+
+  /**
+   * Freeze the live, script-rendered page into a new static project. The
+   * original project remains untouched, which makes this safer than trying
+   * to express a whole-document replacement as thousands of node commands.
+   */
+  private async materializeDocument(): Promise<void> {
+    if (this.contentEditable) this.commitContentEditable();
+    postToHost({
+      type: "notice",
+      message: "正在等待动态页面稳定并生成静态副本…"
+    });
+    await this.waitForDomStability();
+
+    const clone = document.documentElement.cloneNode(true) as HTMLElement;
+    const liveElements = [...document.documentElement.querySelectorAll("*")];
+    const cloneElements = [...clone.querySelectorAll("*")];
+    let canvasSnapshots = 0;
+    for (let index = 0; index < liveElements.length; index += 1) {
+      const live = liveElements[index];
+      const copied = cloneElements[index];
+      if (!live || !copied) continue;
+      if (live instanceof HTMLCanvasElement) {
+        try {
+          const image = document.createElement("img");
+          image.src = live.toDataURL("image/png");
+          image.width = live.width;
+          image.height = live.height;
+          image.alt = live.getAttribute("aria-label") ?? "Canvas snapshot";
+          image.setAttribute(
+            "style",
+            copied.getAttribute("style") ?? live.getAttribute("style") ?? ""
+          );
+          copied.replaceWith(image);
+          canvasSnapshots += 1;
+        } catch {
+          copied.setAttribute("data-hs-materialize-warning", "canvas-unavailable");
+        }
+      }
+      if (live instanceof HTMLElement && live.shadowRoot) {
+        copied.innerHTML = live.shadowRoot.innerHTML;
+        copied.setAttribute("data-hs-materialized-shadow-root", "");
+      }
+    }
+
+    clone.querySelectorAll("[data-hs-overlay]").forEach((element) => {
+      element.remove();
+    });
+    clone.querySelectorAll("[data-hs-runtime-style]").forEach((element) => {
+      element.remove();
+    });
+    clone.querySelectorAll("meta[http-equiv]").forEach((element) => {
+      if (
+        element.getAttribute("http-equiv")?.toLowerCase()
+          === "content-security-policy"
+      ) {
+        element.remove();
+      }
+    });
+    clone.querySelectorAll("script").forEach((script) => {
+      const type = script.getAttribute("type")?.toLowerCase() ?? "";
+      if (type !== "application/json" && type !== "application/ld+json") {
+        script.remove();
+      }
+    });
+
+    let convertedDynamicIds = 0;
+    for (const element of clone.querySelectorAll<HTMLElement>("*")) {
+      element.classList.remove("hs-hover-outline");
+      element.removeAttribute("contenteditable");
+      element.removeAttribute("data-hs-original-text");
+      element.removeAttribute("data-hs-dyn-patches");
+      element.removeAttribute("data-hs-user-script");
+      for (const attribute of [...element.attributes]) {
+        if (attribute.name.toLowerCase().startsWith("on")) {
+          element.removeAttribute(attribute.name);
+        }
+      }
+      const nodeId = element.getAttribute("data-hs-id");
+      if (nodeId?.startsWith("dyn_")) {
+        element.setAttribute("data-hs-id", `node_${crypto.randomUUID()}`);
+        convertedDynamicIds += 1;
+      }
+    }
+
+    const doctype = document.doctype
+      ? `<!doctype ${document.doctype.name}>\n`
+      : "<!doctype html>\n";
+    postToHost({
+      type: "materialized-document",
+      html: `${doctype}${clone.outerHTML}`,
+      stats: {
+        elements: clone.querySelectorAll("*").length,
+        convertedDynamicIds,
+        canvasSnapshots
+      }
     });
   }
 
@@ -2013,52 +4069,79 @@ class EditorRuntime {
     input.click();
   }
 
-  /** Replace the video placeholder with a real <video> element using a data URL. */
+  /** Legacy iframe picker entry point. The host now owns durable imports. */
   private acceptVideo(): void {
-    const input = document.createElement("input");
-    input.type = "file";
-    input.accept = "video/mp4,video/webm,video/ogg";
-    input.style.display = "none";
-    document.body.appendChild(input);
-    input.addEventListener("change", () => {
-      const file = input.files?.[0];
-      if (!file) { input.remove(); return; }
-      const url = URL.createObjectURL(file);
-      this.insertVideo(url, file.name);
-      input.remove();
-    }, { once: true });
-    input.click();
+    postToHost({ type: "notice", message: "请在右侧视频面板中选择本地视频" });
   }
 
-  /** Insert a <video> element as the primary element. */
-  private insertVideo(src: string, title: string): void {
-    const el = document.createElement("video");
-    el.src = src;
-    el.controls = true;
-    el.title = title;
-    el.dataset.hsVideo = "src";
-    el.style.maxWidth = "100%";
-    el.style.borderRadius = "6px";
-    el.style.background = "#000";
+  private acceptVideoAsset(src: string, title: string): void {
+    if (this.primary instanceof HTMLVideoElement) {
+      const target = this.primary;
+      const before = target.getAttribute("src");
+      target.src = src;
+      target.title = title;
+      target.controls = true;
+      target.preload = "metadata";
+      target.dataset.hsVideo = "source";
+      target.load();
+      this.commit({
+        type: "attribute.set",
+        nodeId: idOf(target),
+        name: "src",
+        before,
+        after: src
+      });
+      this.emitSelection();
+      postToHost({ type: "notice", message: "视频已替换并保存到项目资源" });
+      return;
+    }
+
     const parent = (this.primary?.parentElement
       ?? document.querySelector(".page-inner")
       ?? document.body) as HTMLElement;
-    if (!idOf(parent)) parent.dataset.hsId = `node_${crypto.randomUUID()}`;
-    if (this.primary?.isConnected) {
-      this.primary.replaceWith(el);
-    } else {
-      parent.appendChild(el);
+    if (!idOf(parent) && parent !== document.body) {
+      parent.dataset.hsId = `node_${crypto.randomUUID()}`;
     }
+    const video = document.createElement("video");
     const nodeId = `node_${crypto.randomUUID()}`;
-    el.dataset.hsId = nodeId;
+    video.dataset.hsId = nodeId;
+    video.dataset.hsVideo = "source";
+    video.src = src;
+    video.title = title;
+    video.controls = true;
+    video.preload = "metadata";
+    Object.assign(video.style, {
+      display: "block",
+      width: "100%",
+      maxWidth: "100%",
+      minHeight: "180px",
+      borderRadius: "6px",
+      background: "#000"
+    });
+    const ref = this.primary?.isConnected ? this.primary.nextSibling : null;
+    if (ref) parent.insertBefore(video, ref);
+    else parent.appendChild(video);
+    const index = [...parent.children].indexOf(video);
     this.commit({
       type: "node.insert",
-      parentId: idOf(parent),
-      index: [...parent.children].indexOf(el),
-      node: { id: nodeId, tagName: "div", attributes: { "data-hs-video": "src" }, text: title }
+      parentId: persistedIdOf(parent),
+      index,
+      node: {
+        id: nodeId,
+        tagName: "video",
+        attributes: {
+          src,
+          title,
+          controls: "",
+          preload: "metadata",
+          "data-hs-video": "source",
+          style: video.getAttribute("style") ?? ""
+        },
+        text: ""
+      }
     });
-    this.setSelection(el);
-    postToHost({ type: "notice", message: "视频已插入" });
+    this.setSelection(video);
+    postToHost({ type: "notice", message: "视频已插入并保存到项目资源" });
   }
 
   /** GrapesJS TraitManager: set attribute (href/alt/title etc.) */
@@ -2079,18 +4162,38 @@ class EditorRuntime {
       return;
     }
     const sel = window.getSelection();
+    if (sel && sel.rangeCount > 0 && !sel.isCollapsed) {
+      const range = sel.getRangeAt(0);
+      if (range.commonAncestorContainer.isConnected) {
+        this.savedTextRange = range.cloneRange();
+      }
+    }
     // Report floating toolbar position regardless of state
     if (sel && sel.rangeCount > 0 && !sel.isCollapsed) {
       const rect = sel.getRangeAt(0).getBoundingClientRect();
       if (rect.width > 0) {
         this.reportFloatToolbar(true, rect.left + rect.width / 2, rect.top - 12);
       } else {
-        this.reportFloatToolbar(false, 0, 0);
+        const fallback = this.primary.getBoundingClientRect();
+        this.reportFloatToolbar(
+          true,
+          fallback.left + fallback.width / 2,
+          fallback.top - 12
+        );
       }
     } else {
       this.reportFloatToolbar(false, 0, 0);
     }
-    if (this.isTextSelected() || this.primary.isContentEditable) {
+    const caretInsidePrimary = Boolean(
+      sel?.isCollapsed
+      && sel.anchorNode
+      && this.primary.contains(sel.anchorNode)
+    );
+    if (
+      this.isTextSelected()
+      || this.primary.isContentEditable
+      || caretInsidePrimary
+    ) {
       this.emitSelection();
     }
   }
@@ -2101,12 +4204,39 @@ class EditorRuntime {
     });
   }
 
+  private selectionStyleElement(): Element | null {
+    const selection = window.getSelection();
+    if (!selection?.anchorNode) return null;
+    let node: Node | null = selection.anchorNode;
+    if (node instanceof Element) {
+      const offset = selection.anchorOffset;
+      node = node.childNodes.item(offset)
+        ?? node.childNodes.item(Math.max(0, offset - 1))
+        ?? node;
+    }
+    return node instanceof Element ? node : node.parentElement;
+  }
+
   /** GrapesJS StyleManager: query current color state for inline formatting */
   private queryColorState(cmd: string): string {
     try {
+      const element = this.selectionStyleElement();
+      if (element) {
+        const computed = getComputedStyle(element);
+        const color = cmd === "hiliteColor"
+          ? computed.backgroundColor
+          : computed.color;
+        if (
+          color
+          && color !== "rgba(0, 0, 0, 0)"
+          && color !== "transparent"
+        ) {
+          return color;
+        }
+      }
       // document.queryCommandValue returns the current color as a CSS color string
       const val = document.queryCommandValue(cmd);
-      if (typeof val === "string" && val && val !== "rgb(0, 0, 0)" && val !== "transparent") {
+      if (typeof val === "string" && val && val !== "transparent") {
         return val;
       }
     } catch { /* ignore */ }
@@ -2116,28 +4246,114 @@ class EditorRuntime {
   /** GrapesJS StyleManager: query current font size */
   private queryFontSizeState(): string {
     try {
+      const element = this.selectionStyleElement();
+      if (element) {
+        const computed = getComputedStyle(element).fontSize;
+        if (computed) return computed;
+      }
       const val = document.queryCommandValue("fontSize");
       if (typeof val === "string" && val) return val;
     } catch { /* ignore */ }
     return "";
   }
 
+  private previewTextStyle(property: string, value: string): void {
+    try {
+      if (this.textStylePreview?.property === property) {
+        this.textStylePreview.span.style.setProperty(property, value);
+        this.emitSelection();
+        return;
+      }
+      if (this.textStylePreview) {
+        const current = this.textStylePreview;
+        this.commitTextStylePreview(
+          current.property,
+          current.span.style.getPropertyValue(current.property)
+        );
+      }
+      const selection = window.getSelection();
+      if (!selection) return;
+      const liveRange = selection.rangeCount > 0 && !selection.isCollapsed
+        ? selection.getRangeAt(0)
+        : null;
+      const range = liveRange?.commonAncestorContainer.isConnected
+        ? liveRange.cloneRange()
+        : this.savedTextRange?.commonAncestorContainer.isConnected
+          ? this.savedTextRange.cloneRange()
+          : null;
+      if (!range || range.collapsed) return;
+
+      const rangeElement = range.commonAncestorContainer instanceof Element
+        ? range.commonAncestorContainer
+        : range.commonAncestorContainer.parentElement;
+      const host = persistentAnchorOf(rangeElement);
+      if (!host || host === document.body || !idOf(host)) return;
+
+      selection.removeAllRanges();
+      selection.addRange(range);
+      const beforeHtml = host.innerHTML;
+      const span = this.wrapSelectedText(property, value);
+      this.textStylePreview = { host, span, property, beforeHtml };
+      this.setSelection(host);
+    } catch (error) {
+      console.error("[previewTextStyle]", error);
+    }
+  }
+
+  private commitTextStylePreview(property: string, value: string): void {
+    const preview = this.textStylePreview;
+    if (!preview || preview.property !== property) {
+      this.applyTextStyle(property, value);
+      return;
+    }
+    preview.span.style.setProperty(property, value);
+    const afterHtml = preview.host.innerHTML;
+    this.textStylePreview = null;
+    if (afterHtml !== preview.beforeHtml) {
+      this.commit({
+        type: "text.patchStyle",
+        nodeId: idOf(preview.host),
+        before: preview.beforeHtml,
+        after: afterHtml
+      });
+    }
+    const selection = window.getSelection();
+    if (
+      selection
+      && selection.rangeCount > 0
+      && !selection.isCollapsed
+    ) {
+      this.savedTextRange = selection.getRangeAt(0).cloneRange();
+    }
+    this.setSelection(preview.host);
+  }
+
   private applyTextStyle(property: string, value: string): void {
     try {
       const sel = window.getSelection();
-      if (!sel || sel.rangeCount === 0) return;
-      const range = sel.getRangeAt(0);
+      if (!sel) return;
+      const liveRange = sel.rangeCount > 0 && !sel.isCollapsed
+        ? sel.getRangeAt(0)
+        : null;
+      const range = liveRange?.commonAncestorContainer.isConnected
+        ? liveRange.cloneRange()
+        : this.savedTextRange?.commonAncestorContainer.isConnected
+          ? this.savedTextRange.cloneRange()
+          : null;
+      if (!range) {
+        postToHost({ type: "notice", message: "请先选中要格式化的文字" });
+        return;
+      }
       if (range.toString().trim().length === 0 && range.collapsed) {
         // Cursor at empty position — nothing to style yet (user will type next)
         postToHost({ type: "notice", message: "请先选中要格式化的文字" });
         return;
       }
-      let host: Node | null = range.commonAncestorContainer;
-      while (host && host !== document.body) {
-        if (host instanceof HTMLElement && idOf(host)) break;
-        host = host instanceof HTMLElement ? host.parentElement : host.parentNode;
-      }
-      if (!(host instanceof HTMLElement) || !idOf(host)) return;
+      const rangeElement = range.commonAncestorContainer instanceof Element
+        ? range.commonAncestorContainer
+        : range.commonAncestorContainer.parentElement;
+      const host = persistentAnchorOf(rangeElement);
+      if (!host || host === document.body || !idOf(host)) return;
       const beforeHtml = host.innerHTML;
       const beforeRect = host.getBoundingClientRect();
       // Save which element to keep selected after the change
@@ -2151,20 +4367,32 @@ class EditorRuntime {
       sel.addRange(range);
       let cmd = "";
       let cmdValue = "";
+      let useExactWrapper = false;
       switch (property) {
         case "font-weight": cmd = "bold"; break;
         case "font-style": cmd = "italic"; break;
         case "text-decoration": cmd = "underline"; break;
         case "color": cmd = "foreColor"; cmdValue = value; break;
         case "background-color": cmd = "hiliteColor"; cmdValue = value; break;
-        case "font-size": cmd = "fontSize"; cmdValue = String(parseFontSizeValue(value)); break;
+        // execCommand fontSize accepts only legacy values 1-7, so 32px and
+        // 48px can collapse to the same result. Wrap the exact CSS value.
+        case "font-size": useExactWrapper = true; break;
       }
       let ok = false;
-      try {
-        if (cmd) ok = document.execCommand(cmd, false, cmdValue);
-      } catch (err) {
-        console.error("[applyTextStyle] execCommand failed:", err);
-        ok = false;
+      if (useExactWrapper) {
+        try {
+          this.wrapSelectedText(property, value);
+          ok = true;
+        } catch {
+          ok = false;
+        }
+      } else {
+        try {
+          if (cmd) ok = document.execCommand(cmd, false, cmdValue);
+        } catch (err) {
+          console.error("[applyTextStyle] execCommand failed:", err);
+          ok = false;
+        }
       }
       if (!ok) {
         try { this.wrapSelectedText(property, value); ok = true; }
@@ -2196,6 +4424,14 @@ class EditorRuntime {
         before: beforeHtml,
         after: afterHtml
       });
+      const updatedSelection = window.getSelection();
+      if (
+        updatedSelection
+        && updatedSelection.rangeCount > 0
+        && !updatedSelection.isCollapsed
+      ) {
+        this.savedTextRange = updatedSelection.getRangeAt(0).cloneRange();
+      }
       // Re-establish selection on the element so the user can keep editing
       this.setSelection(keepSelected);
     } catch (err) {
@@ -2203,9 +4439,11 @@ class EditorRuntime {
     }
   }
 
-  private wrapSelectedText(property: string, value: string): void {
+  private wrapSelectedText(property: string, value: string): HTMLSpanElement {
     const sel = window.getSelection();
-    if (!sel || sel.rangeCount === 0) return;
+    if (!sel || sel.rangeCount === 0) {
+      throw new Error("No active text range");
+    }
     const range = sel.getRangeAt(0);
     const span = document.createElement("span");
     span.style.setProperty(property, value);
@@ -2216,6 +4454,12 @@ class EditorRuntime {
       span.appendChild(fragment);
       range.insertNode(span);
     }
+    const updatedRange = document.createRange();
+    updatedRange.selectNodeContents(span);
+    sel.removeAllRanges();
+    sel.addRange(updatedRange);
+    this.savedTextRange = updatedRange.cloneRange();
+    return span;
   }
 }
 

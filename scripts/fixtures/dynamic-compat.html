@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dynamic compatibility fixture</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="min-h-screen bg-slate-950 text-white">
+  <main class="grid grid-cols-2 gap-4 p-8" id="report-root">
+    <h1 class="col-span-2 text-3xl font-bold">Dynamic report</h1>
+    <section id="cards" class="contents"></section>
+  </main>
+  <script>
+    const records = [
+      { key: "alpha", title: "Alpha" },
+      { key: "beta", title: "Beta" }
+    ];
+    let reversed = false;
+    function renderCards() {
+      const rows = reversed ? [...records].reverse() : records;
+      document.getElementById("cards").innerHTML = rows.map((record) => `
+        <article data-key="${record.key}" class="rounded-xl bg-slate-800 p-5">
+          <h2 class="text-xl font-semibold">${record.title}</h2>
+          <p>Generated at runtime</p>
+        </article>
+      `).join("");
+    }
+    window.__sierraTestRerender = () => {
+      reversed = !reversed;
+      renderCards();
+    };
+    renderCards();
+  </script>
+</body>
+</html>

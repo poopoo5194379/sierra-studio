@@ -60,4 +60,51 @@ describe("ProjectSession recovery", () => {
     expect(recovered.snapshot().html).toContain("Recovered");
     recovered.close();
   });
+
+  it("supports repeated undo and redo across several revisions", async () => {
+    const root = await mkdtemp(join(tmpdir(), "html-studio-history-"));
+    temporaryDirectories.push(root);
+    const initial = createSafeWorkingDocument(
+      "<html><body><p>Step 0</p></body></html>"
+    );
+    const nodeId = initial.match(/<p data-hs-id="([^"]+)"/)?.[1];
+    expect(nodeId).toBeTruthy();
+    const session = await ProjectSession.create(
+      root,
+      "project_history",
+      "document_history",
+      initial
+    );
+
+    for (let revision = 1; revision <= 4; revision += 1) {
+      await session.execute({
+        commandId: randomUUID(),
+        commandVersion: 1,
+        documentId: "document_history",
+        baseRevision: revision - 1,
+        resultingRevision: revision,
+        payload: {
+          type: "text.set",
+          nodeId,
+          before: `Step ${revision - 1}`,
+          after: `Step ${revision}`
+        }
+      });
+    }
+
+    for (let revision = 3; revision >= 0; revision -= 1) {
+      const result = await session.undo();
+      expect(result.revision).toBe(revision);
+      expect(session.snapshot().html).toContain(`Step ${revision}`);
+    }
+    expect((await session.undo()).inverse).toBeNull();
+
+    for (let revision = 1; revision <= 4; revision += 1) {
+      const result = await session.redo();
+      expect(result.revision).toBe(revision);
+      expect(session.snapshot().html).toContain(`Step ${revision}`);
+    }
+    expect((await session.redo()).forward).toBeNull();
+    session.close();
+  });
 });

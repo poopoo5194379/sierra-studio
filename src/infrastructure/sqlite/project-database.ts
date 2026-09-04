@@ -23,7 +23,7 @@ export interface AssetRecord {
 }
 
 export class ProjectDatabase {
-  private static readonly SCHEMA_VERSION = 1;
+  private static readonly SCHEMA_VERSION = 2;
   private readonly database: DatabaseSync;
 
   constructor(databasePath: string) {
@@ -54,8 +54,10 @@ export class ProjectDatabase {
         `Project database version ${row.user_version} is newer than supported`
       );
     }
-    if (row.user_version === 0) this.transaction(() => {
-      this.database.exec(`
+    let version = row.user_version;
+    if (version === 0) {
+      this.transaction(() => {
+        this.database.exec(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
         version INTEGER PRIMARY KEY,
         applied_at TEXT NOT NULL
@@ -100,7 +102,24 @@ export class ProjectDatabase {
       VALUES (1, datetime('now'));
       PRAGMA user_version = 1;
       `);
-    });
+      });
+      version = 1;
+    }
+    if (version < 2) {
+      this.transaction(() => {
+        this.database.exec(`
+        CREATE TABLE IF NOT EXISTS project_settings (
+          key TEXT PRIMARY KEY,
+          value_json TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+
+        INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+        VALUES (2, datetime('now'));
+        PRAGMA user_version = 2;
+        `);
+      });
+    }
   }
 
   initializeMetadata(entries: Record<string, string>): void {
@@ -117,6 +136,28 @@ export class ProjectDatabase {
       .prepare("SELECT value FROM metadata WHERE key = ?")
       .get(key) as { value: string } | undefined;
     return row?.value;
+  }
+
+  getProjectSetting(key: string): unknown {
+    const row = this.database.prepare(
+      "SELECT value_json FROM project_settings WHERE key = ?"
+    ).get(key) as { value_json: string } | undefined;
+    if (!row) return undefined;
+    try {
+      return JSON.parse(row.value_json) as unknown;
+    } catch {
+      return undefined;
+    }
+  }
+
+  setProjectSetting(key: string, value: unknown): void {
+    this.database.prepare(`
+      INSERT INTO project_settings(key, value_json, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET
+        value_json = excluded.value_json,
+        updated_at = excluded.updated_at
+    `).run(key, JSON.stringify(value), new Date().toISOString());
   }
 
   appendOperation(

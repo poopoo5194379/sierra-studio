@@ -11,6 +11,7 @@ export interface CommandCommitResult {
 
 export class CommandCoordinator {
   private queue: Promise<void> = Promise.resolve();
+  private generation = 0;
 
   constructor(
     private readonly getRevision: () => number,
@@ -25,12 +26,15 @@ export class CommandCoordinator {
   ) {}
 
   enqueue(context: CommandContext, payload: CommandPayload): void {
+    const generation = this.generation;
     this.queue = this.queue.then(async () => {
+      if (generation !== this.generation) return;
       const baseRevision = this.getRevision();
       const result = await this.execute(context, payload, baseRevision);
       this.setRevision(result.revision);
       this.onCommitted(result.revision);
     }).catch((error: unknown) => {
+      this.generation += 1;
       this.onFailed(error);
     });
   }

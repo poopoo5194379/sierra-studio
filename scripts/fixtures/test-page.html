@@ -1,10 +1,13 @@
 <!doctype html>
 <html><head><meta charset="utf-8"><title>Test</title>
+<script src="https://index.datastory.com.cn/libs/echarts/5.6.0/echarts.min.js"></script>
+<script src="https://index.datastory.com.cn/libs/echarts-wordcloud/2.1.0/echarts-wordcloud.min.js"></script>
 <style>body { font-family: sans-serif; padding: 20px; }
 h1 { color: #4f7cff; }
 .card { border: 1px solid #ccc; padding: 16px; border-radius: 8px; margin: 12px 0; }
 .row { display: flex; gap: 12px; }
 .col { flex: 1; }
+.imported-chart { width: 320px; height: 180px; }
 </style></head>
 <body>
 <h1 data-hs-id="h1-1">Test Heading One</h1>
@@ -17,5 +20,32 @@ h1 { color: #4f7cff; }
   <div class="col" data-hs-id="col-1">Column A</div>
   <div class="col" data-hs-id="col-2">Column B</div>
 </div>
+<section id="runtime-list" data-hs-id="runtime-list"></section>
 <img data-hs-id="img-1" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='120'%3E%3Crect width='200' height='120' fill='%23aab'/%3E%3C/svg%3E" alt="test" />
+<div id="imported-line-chart" class="imported-chart"></div>
+<div id="imported-word-cloud" class="imported-chart"></div>
+<script>
+  document.getElementById("runtime-list").innerHTML = [
+    ["alpha", "Runtime Alpha"],
+    ["beta", "Runtime Beta"],
+    ["gamma", "Runtime Gamma"]
+  ].map(([key, title]) =>
+    `<article class="runtime-card card" data-key="${key}"><h3>${title}</h3></article>`
+  ).join("");
+  echarts.init(document.getElementById("imported-line-chart")).setOption({
+    xAxis: { type: "category", data: ["A", "B", "C"] },
+    yAxis: { type: "value" },
+    series: [{ type: "line", data: [12, 28, 19] }]
+  });
+  echarts.init(document.getElementById("imported-word-cloud")).setOption({
+    series: [{
+      type: "wordCloud",
+      data: [
+        { name: "local", value: 10 },
+        { name: "offline", value: 8 },
+        { name: "editable", value: 6 }
+      ]
+    }]
+  });
+</script>
 </body></html>

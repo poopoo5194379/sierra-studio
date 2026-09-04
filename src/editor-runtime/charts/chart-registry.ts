@@ -11,6 +11,7 @@ import {
 } from "../dom";
 import { ChartJsAdapter } from "./chartjs-adapter";
 import { EChartsAdapter } from "./echarts-adapter";
+import { SvgChartAdapter } from "./svg-chart-adapter";
 import type {
   ChartAdapter,
   ChartHandle,
@@ -20,8 +21,14 @@ import type {
 export class ChartRegistry {
   private readonly echarts = new EChartsAdapter();
   private readonly chartjs = new ChartJsAdapter();
-  private readonly adapters: ChartAdapter[] = [this.echarts, this.chartjs];
+  private readonly svg = new SvgChartAdapter();
+  private readonly adapters: ChartAdapter[] = [
+    this.echarts,
+    this.chartjs,
+    this.svg
+  ];
   private readonly overrides: ChartOverrideManifest = readChartManifest(document);
+  private readonly baselines = new Map<string, ChartPatch>();
 
   find(target: Element | null): ChartHandle | null {
     if (!target) return null;
@@ -72,21 +79,50 @@ export class ChartRegistry {
   }
 
   readPatch(handle: ChartHandle): ChartPatch {
-    return this.overrides[this.keyOf(handle)] ?? {};
+    const chartKey = this.keyOf(handle);
+    return this.overrides[chartKey] ?? this.baselineOf(chartKey, handle);
   }
 
   remember(chartKey: string, patch: ChartPatch): void {
     this.overrides[chartKey] = patch;
   }
 
+  applyOverride(chartKey: string, patch: ChartPatch): boolean {
+    const handle = this.allHandles().find(
+      (candidate) => this.keyOf(candidate) === chartKey
+    );
+    if (!handle) return false;
+    const baseline = this.baselineOf(chartKey, handle);
+    if (Object.keys(patch).length === 0) delete this.overrides[chartKey];
+    else this.overrides[chartKey] = patch;
+    handle.apply({ ...baseline, ...patch });
+    handle.resize();
+    return true;
+  }
+
   restoreOverrides(): void {
     if (Object.keys(this.overrides).length === 0) return;
     for (const handle of this.allHandles()) {
-      const patch = this.overrides[this.keyOf(handle)];
+      const chartKey = this.keyOf(handle);
+      const patch = this.overrides[chartKey];
       if (!patch) continue;
-      handle.apply(patch);
+      handle.apply({ ...this.baselineOf(chartKey, handle), ...patch });
       handle.resize();
     }
+  }
+
+  private baselineOf(chartKey: string, handle: ChartHandle): ChartPatch {
+    const existing = this.baselines.get(chartKey);
+    if (existing) return existing;
+    const snapshot = handle.snapshot();
+    const baseline: ChartPatch = {
+      title: snapshot.title,
+      legendVisible: snapshot.legendVisible,
+      primaryColor: snapshot.primaryColor,
+      data: snapshot.data
+    };
+    this.baselines.set(chartKey, baseline);
+    return baseline;
   }
 
   private allHandles(): ChartHandle[] {
@@ -103,6 +139,13 @@ export class ChartRegistry {
     }
     for (const canvas of document.querySelectorAll<HTMLCanvasElement>("canvas")) {
       const handle = this.chartjs.findByElement(canvas);
+      if (handle && !seen.has(handle.element)) {
+        handles.push(handle);
+        seen.add(handle.element);
+      }
+    }
+    for (const svg of document.querySelectorAll<SVGSVGElement>("svg")) {
+      const handle = this.svg.find(svg);
       if (handle && !seen.has(handle.element)) {
         handles.push(handle);
         seen.add(handle.element);

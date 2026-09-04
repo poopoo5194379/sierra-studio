@@ -1,0 +1,57 @@
+name: macOS Local Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/macos-local-build
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - name: Install exactly from lockfile
+        run: npm ci --no-audit --no-fund
+
+      - name: Verify source
+        run: npm test -- --run && npm run typecheck
+
+      - name: Create macOS icon
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf build/icon.iconset
+          mkdir -p build/icon.iconset
+          for size in 16 32 128 256 512; do
+            sips -z "$size" "$size" build/icon.png --out "build/icon.iconset/icon_${size}x${size}.png" >/dev/null
+            double=$((size * 2))
+            sips -z "$double" "$double" build/icon.png --out "build/icon.iconset/icon_${size}x${size}@2x.png" >/dev/null
+          done
+          iconutil -c icns build/icon.iconset -o build/icon.icns
+
+      - name: Build unsigned DMGs
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npm run pack:mac
+
+      - name: Upload DMGs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: SierraStudio-macOS-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 14
+          path: release/*.dmg

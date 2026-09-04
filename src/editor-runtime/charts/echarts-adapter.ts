@@ -48,13 +48,29 @@ class EChartsHandle implements ChartHandle {
     const title = firstObject(option.title);
     const legend = firstObject(option.legend);
     const xAxis = firstObject(option.xAxis);
+    let pieLabels: Array<string | number> | undefined;
     const series = Array.isArray(option.series)
       ? option.series.map((value) => {
         const item = firstObject(value);
+        const rawData = Array.isArray(item.data) ? item.data : [];
+        const isPie = item.type === "pie";
+        if (isPie) {
+          const pieItems = rawData.map(firstObject);
+          pieLabels = pieItems.map((entry, index) =>
+            typeof entry.name === "string" || typeof entry.name === "number"
+              ? entry.name
+              : index + 1
+          );
+          return {
+            ...(typeof item.name === "string" ? { name: item.name } : {}),
+            type: "pie",
+            data: pieItems.map((entry) => entry.value)
+          };
+        }
         return {
           ...(typeof item.name === "string" ? { name: item.name } : {}),
           ...(typeof item.type === "string" ? { type: item.type } : {}),
-          data: Array.isArray(item.data) ? item.data : []
+          data: rawData
         };
       })
       : [];
@@ -65,7 +81,8 @@ class EChartsHandle implements ChartHandle {
       legendVisible: legend.show !== false,
       primaryColor: firstString(option.color) ?? "#5470c6",
       data: {
-        ...(Array.isArray(xAxis.data) ? { labels: xAxis.data.filter(
+        ...(pieLabels ? { labels: pieLabels } : {}),
+        ...(!pieLabels && Array.isArray(xAxis.data) ? { labels: xAxis.data.filter(
           (value): value is string | number =>
             typeof value === "string" || typeof value === "number"
         ) } : {}),

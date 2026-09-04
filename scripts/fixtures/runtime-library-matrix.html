@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>Runtime library matrix</title>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&family=Noto+Sans+SC:wght@400;700">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/7.0.0/css/all.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swiper@11/swiper-bundle.min.css">
+  <link rel="stylesheet" href="https://unpkg.com/aos@2.3.4/dist/aos.css">
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+  <script src="https://code.highcharts.com/highcharts.js"></script>
+  <script src="https://cdn.plot.ly/plotly-3.7.0.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3.15.0/dist/gsap.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r160/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/animejs@3.2.2/lib/anime.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.15.12/dist/cdn.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/swiper@11/swiper-bundle.min.js"></script>
+  <script src="https://unpkg.com/aos@2.3.4/dist/aos.js"></script>
+  <style>
+    body { margin: 0; padding: 24px; font-family: Inter, "Noto Sans SC", sans-serif; }
+    .matrix { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .matrix > div { min-height: 80px; padding: 12px; border: 1px solid #ddd; }
+    #highcharts, #plotly { min-height: 180px; }
+    .swiper { width: 240px; height: 100px; }
+    .swiper-slide { display: grid; place-items: center; background: #eef3ff; }
+  </style>
+</head>
+<body>
+  <h1>常见库与字体离线矩阵</h1>
+  <p id="font-sample">Inter 2026 · 中文字体正常</p>
+  <i id="fontawesome" class="fa-solid fa-chart-column"></i>
+  <div class="matrix">
+    <div id="d3"></div>
+    <div id="highcharts"></div>
+    <div id="plotly"></div>
+    <div class="mermaid">graph LR; A[Import] --> B[Local]</div>
+    <div id="gsap">GSAP</div>
+    <div id="anime">Anime</div>
+    <div id="aos" data-aos="fade-up">AOS</div>
+    <div x-data="{ label: 'Alpine' }"><span id="alpine" x-text="label"></span></div>
+    <div class="swiper">
+      <div class="swiper-wrapper">
+        <div class="swiper-slide">Swiper 1</div>
+        <div class="swiper-slide">Swiper 2</div>
+      </div>
+    </div>
+  </div>
+  <script>
+    window.__runtimeMatrixReady = (async () => {
+      d3.select("#d3").text("D3");
+      Highcharts.chart("highcharts", {
+        title: { text: "Highcharts" },
+        series: [{ data: [1, 3, 2] }]
+      });
+      await Plotly.newPlot("plotly", [{
+        x: ["A", "B"],
+        y: [1, 2],
+        type: "bar"
+      }], { title: "Plotly" });
+      mermaid.initialize({ startOnLoad: false });
+      await mermaid.run({ querySelector: ".mermaid" });
+      gsap.set("#gsap", { opacity: 0.9 });
+      const scene = new THREE.Scene();
+      anime({ targets: "#anime", opacity: [0.5, 1], duration: 1 });
+      const swiper = new Swiper(".swiper", { loop: false });
+      AOS.init({ duration: 1 });
+      await document.fonts.load('16px "Inter"');
+      await document.fonts.load('16px "Noto Sans SC"', "中文");
+      return {
+        bootstrap: typeof bootstrap?.Modal === "function",
+        d3: typeof d3?.select === "function",
+        highcharts: typeof Highcharts?.chart === "function",
+        plotly: typeof Plotly?.newPlot === "function",
+        mermaid: typeof mermaid?.run === "function",
+        gsap: typeof gsap?.to === "function",
+        three: scene instanceof THREE.Scene,
+        animejs: typeof anime === "function",
+        alpinejs: typeof Alpine?.start === "function",
+        swiper: typeof swiper?.slideNext === "function",
+        aos: typeof AOS?.init === "function",
+        inter: document.fonts.check('16px "Inter"'),
+        notoSansSc: document.fonts.check('16px "Noto Sans SC"', "中文"),
+        fontAwesome:
+          getComputedStyle(document.querySelector("#fontawesome"), "::before")
+            .fontFamily.toLowerCase().includes("awesome")
+      };
+    })();
+  </script>
+</body>
+</html>

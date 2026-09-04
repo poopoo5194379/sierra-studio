@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { ChartPatchSchema } from "../charts/chart-types";
+import { WatermarkSettingsSchema } from "../watermarks/watermark-model";
 
 export const StyleDeclarationSchema = z.object({
   property: z.string().min(1),
@@ -38,8 +39,13 @@ const SetAttributePayloadSchema = z.object({
 
 const NodeSnapshotSchema = z.object({
   id: z.string().min(1),
-  tagName: z.enum(["img", "div", "p", "span", "h1", "h2", "h3", "hr", "button"]),
+  tagName: z.string().regex(/^[A-Za-z][A-Za-z0-9-]*$/),
   attributes: z.record(z.string(), z.string()),
+  /**
+   * Command version 1 originally named this field `text`, but the editor
+   * runtime has always populated it with element.innerHTML. Keep the field
+   * name for replay compatibility and consistently treat it as HTML.
+   */
   text: z.string().default("")
 });
 
@@ -80,6 +86,58 @@ const PatchTextStylePayloadSchema = z.object({
   after: z.string()
 });
 
+const AttributeChangeSchema = z.object({
+  nodeId: z.string().min(1),
+  name: z.string().regex(/^[A-Za-z_:][A-Za-z0-9_.:-]*$/),
+  before: z.string().nullable(),
+  after: z.string().nullable()
+});
+
+const ManagedStyleChangeSchema = z.object({
+  styleId: z.string().regex(/^[a-z][a-z0-9_-]*$/i),
+  before: z.string().nullable(),
+  after: z.string().nullable()
+});
+
+/**
+ * Atomic project-document patch.
+ *
+ * Responsive rules need to add an export-stable class and update the managed
+ * stylesheet as one undoable action. Theme changes only update a managed
+ * stylesheet. Keeping both operations in one command prevents half-applied
+ * undo/redo states and leaves room for future component/data metadata.
+ */
+const DocumentPatchPayloadSchema = z.object({
+  type: z.literal("document.patch"),
+  attributes: z.array(AttributeChangeSchema),
+  managedStyles: z.array(ManagedStyleChangeSchema)
+});
+
+const ComponentContentChangeSchema = z.object({
+  nodeId: z.string().min(1),
+  before: z.string(),
+  after: z.string()
+});
+
+/**
+ * A component field update can touch the master and many instances. It is a
+ * single command so one undo restores content, styles, override metadata and
+ * component versions together.
+ */
+const ComponentUpdatePayloadSchema = z.object({
+  type: z.literal("component.update"),
+  texts: z.array(ComponentContentChangeSchema),
+  html: z.array(ComponentContentChangeSchema),
+  styles: z.array(NodeStyleChangeSchema),
+  attributes: z.array(AttributeChangeSchema)
+});
+
+const SetWatermarksPayloadSchema = z.object({
+  type: z.literal("watermarks.set"),
+  before: WatermarkSettingsSchema,
+  after: WatermarkSettingsSchema
+});
+
 export const CommandPayloadSchema = z.discriminatedUnion("type", [
   SetStylesPayloadSchema,
   SetTextPayloadSchema,
@@ -88,7 +146,10 @@ export const CommandPayloadSchema = z.discriminatedUnion("type", [
   DeleteNodePayloadSchema,
   MoveNodePayloadSchema,
   PatchChartPayloadSchema,
-  PatchTextStylePayloadSchema
+  PatchTextStylePayloadSchema,
+  DocumentPatchPayloadSchema,
+  ComponentUpdatePayloadSchema,
+  SetWatermarksPayloadSchema
 ]);
 
 export type CommandPayload = z.infer<typeof CommandPayloadSchema>;
@@ -159,5 +220,45 @@ export function invertPayload(payload: CommandPayload): CommandPayload {
         before: payload.after,
         after: payload.before
       };
+    case "document.patch":
+      return {
+        ...payload,
+        attributes: payload.attributes.map((change) => ({
+          ...change,
+          before: change.after,
+          after: change.before
+        })),
+        managedStyles: payload.managedStyles.map((change) => ({
+          ...change,
+          before: change.after,
+          after: change.before
+        }))
+      };
+    case "component.update":
+      return {
+        ...payload,
+        texts: payload.texts.map((change) => ({
+          ...change,
+          before: change.after,
+          after: change.before
+        })),
+        html: payload.html.map((change) => ({
+          ...change,
+          before: change.after,
+          after: change.before
+        })),
+        styles: payload.styles.map((change) => ({
+          ...change,
+          before: change.after,
+          after: change.before
+        })),
+        attributes: payload.attributes.map((change) => ({
+          ...change,
+          before: change.after,
+          after: change.before
+        }))
+      };
+    case "watermarks.set":
+      return { ...payload, before: payload.after, after: payload.before };
   }
 }
