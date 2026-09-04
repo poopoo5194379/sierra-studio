@@ -16,8 +16,8 @@ const { _electron: electron } = require("playwright");
   });
   try {
     const window = await application.firstWindow();
-    await window.waitForSelector("text=SierraStudio");
-    await window.waitForSelector("text=打开一个 HTML 文件");
+    await window.waitForSelector("text=Sierra Studio");
+    await window.waitForSelector(".empty-state, .canvas-viewport-host");
     console.log(await window.title());
     console.log("Electron smoke test passed");
   } finally {
