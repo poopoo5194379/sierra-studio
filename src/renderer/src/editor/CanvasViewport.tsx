@@ -10,7 +10,9 @@ interface CanvasViewportProps {
   projectId: string;
   reloadKey: number;
   viewportWidth: number;
-  viewportHeight: number;
+  canvasWidth: number;
+  canvasHeight: number;
+  allowUpscale: boolean;
   iframeRef: RefObject<HTMLIFrameElement | null>;
   runtimeState: "loading" | "ready" | "error";
   onReload: () => void;
@@ -21,13 +23,21 @@ export function CanvasViewport({
   projectId,
   reloadKey,
   viewportWidth,
-  viewportHeight,
+  canvasWidth,
+  canvasHeight,
+  allowUpscale,
   iframeRef,
   runtimeState,
   onReload
 }: CanvasViewportProps): React.JSX.Element {
   const hostRef = useRef<HTMLDivElement>(null);
-  const [scale, setScale] = useState(1);
+  const [fitScale, setFitScale] = useState(1);
+  const canvasScale = canvasWidth / viewportWidth;
+  const viewportHeight = Math.max(
+    240,
+    Math.round(canvasHeight / canvasScale)
+  );
+  const frameScale = canvasScale * fitScale;
   // Tracking for undo/redo navigations without destroying iframe
   const prevReloadRef = useRef<number | null>(null);
 
@@ -36,13 +46,14 @@ export function CanvasViewport({
     if (!host) return;
     const update = (): void => {
       const availableWidth = Math.max(320, host.clientWidth - 56);
-      setScale(Math.min(1, availableWidth / viewportWidth));
+      const nextScale = availableWidth / canvasWidth;
+      setFitScale(allowUpscale ? nextScale : Math.min(1, nextScale));
     };
     update();
     const observer = new ResizeObserver(update);
     observer.observe(host);
     return () => observer.disconnect();
-  }, [viewportWidth]);
+  }, [allowUpscale, canvasWidth]);
 
   // When reloadKey changes after initial mount, navigate the iframe's src
   // instead of destroying it (avoids white flash on undo/redo).
@@ -76,8 +87,8 @@ export function CanvasViewport({
       <div
         className="canvas-scale-stage"
         style={{
-          width: `${viewportWidth * scale}px`,
-          height: `${viewportHeight * scale}px`
+          width: `${canvasWidth * fitScale}px`,
+          height: `${canvasHeight * fitScale}px`
         }}
       >
         <div
@@ -85,7 +96,7 @@ export function CanvasViewport({
           style={{
             width: `${viewportWidth}px`,
             height: `${viewportHeight}px`,
-            transform: `scale(${scale})`
+            transform: `scale(${frameScale})`
           }}
         >
           <iframe
@@ -98,8 +109,8 @@ export function CanvasViewport({
         </div>
       </div>
       <div className="viewport-badge">
-        浏览器画布 {viewportWidth} × {viewportHeight}
-        <span>{Math.round(scale * 100)}%</span>
+        显示画布 {canvasWidth} × {canvasHeight}
+        <span>响应式宽度 {viewportWidth} · {Math.round(frameScale * 100)}%</span>
       </div>
     </div>
   );

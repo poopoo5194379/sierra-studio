@@ -7,6 +7,7 @@ const path = require("node:path");
 const ROOT = path.resolve(__dirname, "..");
 const UNPACKED = path.join(ROOT, "release", "win-unpacked");
 const TARGET = path.join(UNPACKED, "package.json");
+const appPackage = require(path.join(ROOT, "package.json"));
 
 if (!fs.existsSync(UNPACKED)) {
   console.log("[post-build] No win-unpacked at " + UNPACKED);
@@ -21,7 +22,7 @@ if (!fs.existsSync(path.join(UNPACKED, "SierraStudio.exe"))) {
 const thin = {
   name: "sierra-studio",
   productName: "SierraStudio",
-  version: "0.3.5",
+  version: appPackage.version,
   main: "./resources/app.asar"
 };
 

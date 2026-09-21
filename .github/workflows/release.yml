@@ -11,7 +11,7 @@ permissions:
   attestations: write
 
 jobs:
-  build:
+  build-windows:
     runs-on: windows-latest
     timeout-minutes: 60
 
@@ -87,3 +87,82 @@ jobs:
               ForEach-Object { $_.FullName }
           )
           gh release upload $tag $assets --clobber
+
+  build-macos:
+    needs: build-windows
+    runs-on: macos-14
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - name: Install
+        run: npm ci --no-audit --no-fund
+
+      - name: Verify tag matches package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          if [[ "v${version}" != "${{ github.ref_name }}" ]]; then
+            echo "Tag ${{ github.ref_name }} does not match package.json version v${version}." >&2
+            exit 1
+          fi
+
+      - name: Verify source
+        run: npm run check
+
+      - name: Create macOS icon
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf build/icon.iconset
+          mkdir -p build/icon.iconset
+          for size in 16 32 128 256 512; do
+            sips -z "$size" "$size" build/icon.png --out "build/icon.iconset/icon_${size}x${size}.png" >/dev/null
+            double=$((size * 2))
+            sips -z "$double" "$double" build/icon.png --out "build/icon.iconset/icon_${size}x${size}@2x.png" >/dev/null
+          done
+          iconutil -c icns build/icon.iconset -o build/icon.icns
+
+      - name: Build macOS DMGs
+        env:
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npm run pack:mac
+
+      - name: Generate macOS checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release
+          shasum -a 256 ./*.dmg > SHA256SUMS-macOS.txt
+
+      - name: Attest macOS installer build provenance
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        with:
+          subject-path: release/*.dmg
+
+      - name: Publish macOS release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(release/*.dmg release/*.dmg.blockmap release/latest-mac.yml release/SHA256SUMS-macOS.txt)
+          if (( ${#assets[@]} == 0 )); then
+            echo "No macOS release assets were produced." >&2
+            exit 1
+          fi
+          gh release upload "${{ github.ref_name }}" "${assets[@]}" --clobber

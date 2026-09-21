@@ -1,12 +1,17 @@
 # SierraStudio Architecture
 
+> 2026-07-26 更新：完整的当前架构、历史决策、Bug 根因和新项目避坑清单见
+> [`../html编辑器-迭代记录.md`](../html编辑器-迭代记录.md)。
+> 本文保留为架构摘要；若两者与旧对话记录发生冲突，以当前代码和新版迭代记录为准。
+
 ## 不可破坏的约束
 
 1. 只有 Electron Main 可以访问文件系统与 SQLite。
 2. 导入的原稿只读，编辑只发生在可重建的 working copy。
 3. 已校验的 checkpoint 与有序 command log 是唯一事实来源。
 4. 每次持久化修改都是带 before/after 的版本化命令。
-5. iframe 使用 opaque-origin sandbox；用户脚本、联网、弹窗和对象嵌入均禁用。
+5. iframe 与 Host 保持跨源隔离；用户脚本可在受限画布执行，但任意联网、弹窗、
+   导航和对象嵌入均禁用，已识别依赖映射为本地 runtime。
 6. 几何和用户明确修改的样式写入节点内联 CSS，并完整保留旧值与 `!important`。
 7. 编辑器覆盖框只存在于 runtime，不写入项目 HTML。
 
@@ -38,8 +43,8 @@ React host ──typed postMessage──> Editor Runtime (sandboxed iframe)
 - `assets/**`
 
 `project.sqlite`、`project.json`、`source/**` 和 `snapshots/**` 均不可通过协议读取。
-Main 在返回 working HTML 时注入严格 CSP 与唯一允许的
-`htmlstudio-runtime://bundle/editor-runtime.js`。画布禁止任意网络连接。
+Main 在返回 working HTML 时注入严格 CSP，并只允许 Editor Runtime 与受控的
+本地图表依赖。画布禁止任意网络连接。
 
 ## 项目目录
 

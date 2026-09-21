@@ -161,6 +161,238 @@ function withoutQueryOrHash(value: string): string {
   return value.split(/[?#]/, 1)[0] ?? value;
 }
 
+/**
+ * linkedom treats the first top-level element as documentElement when an HTML
+ * file omits its opening <html>/<head> tags. A browser repairs that markup,
+ * but serializing linkedom's result would otherwise keep only that first node
+ * (commonly <title>) and silently discard the page body.
+ */
+export function normalizeImportedDocumentShell(sourceHtml: string): string {
+  if (/<html(?:\s|>)/i.test(sourceHtml)) return sourceHtml;
+
+  const doctypeMatch = sourceHtml.match(/^\s*(<!doctype\s+html[^>]*>)/i);
+  const doctype = doctypeMatch?.[1] ?? "<!doctype html>";
+  const markup = doctypeMatch
+    ? sourceHtml.slice(doctypeMatch[0].length)
+    : sourceHtml;
+  const bodyIndex = markup.search(/<body(?:\s|>)/i);
+  const hasClosingHtml = /<\/html\s*>/i.test(markup);
+  let contents: string;
+
+  if (bodyIndex >= 0) {
+    const beforeBody = markup.slice(0, bodyIndex);
+    const bodyAndAfter = markup.slice(bodyIndex);
+    if (/<head(?:\s|>)/i.test(beforeBody)) {
+      contents = `${beforeBody}${bodyAndAfter}`;
+    } else {
+      const headContents = beforeBody.replace(/<\/head\s*>\s*$/i, "");
+      contents = `<head>${headContents}</head>${bodyAndAfter}`;
+    }
+  } else if (/<head(?:\s|>)/i.test(markup)) {
+    contents = markup;
+  } else {
+    contents = `<head></head><body>${markup}</body>`;
+  }
+
+  return `${doctype}\n<html>${contents}${hasClosingHtml ? "" : "</html>"}`;
+}
+
+function svgNumber(element: Element, name: string, fallback = 0): number {
+  const value = Number.parseFloat(element.getAttribute(name) ?? "");
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function svgColorWithOpacity(color: string, opacityValue: string | null): string {
+  if (opacityValue === null) return color;
+  const opacity = Number.parseFloat(opacityValue);
+  if (!Number.isFinite(opacity) || opacity >= 1) return color;
+  const hex = color.match(/^#([\da-f]{3}|[\da-f]{6})$/i)?.[1];
+  if (hex) {
+    const normalized = hex.length === 3
+      ? [...hex].map((character) => `${character}${character}`).join("")
+      : hex;
+    return `rgba(${Number.parseInt(normalized.slice(0, 2), 16)}, ${Number.parseInt(normalized.slice(2, 4), 16)}, ${Number.parseInt(normalized.slice(4, 6), 16)}, ${opacity})`;
+  }
+  const rgb = color.match(/^rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)$/i);
+  return rgb ? `rgba(${rgb[1]}, ${rgb[2]}, ${rgb[3]}, ${opacity})` : color;
+}
+
+function svgPaint(svg: SVGSVGElement, element: Element, name: string): string {
+  const raw = element.getAttribute(name)
+    ?? (element.getAttribute("class")?.includes("s-muted")
+      ? "var(--muted)"
+      : element.getAttribute("class")?.includes("s-card")
+        ? "var(--card)"
+        : element.getAttribute("class")?.includes("s-fg")
+          ? "var(--fg)"
+          : "transparent");
+  const reference = raw.match(/^url\(#([^)]+)\)$/)?.[1];
+  if (!reference) return raw;
+  const gradient = [...svg.querySelectorAll("linearGradient, lineargradient, radialGradient, radialgradient")]
+    .find((candidate) => candidate.getAttribute("id") === reference);
+  if (!gradient) return "transparent";
+  const stops = [...gradient.querySelectorAll("stop")].map((stop) => {
+    const color = svgColorWithOpacity(
+      stop.getAttribute("stop-color") ?? "transparent",
+      stop.getAttribute("stop-opacity")
+    );
+    const offset = stop.getAttribute("offset") ?? "0%";
+    return `${color} ${offset}`;
+  });
+  // A CSS gradient is exported as a small SVG picture. Use its leading color
+  // for explicit editable diagrams so the corresponding box stays a native
+  // PowerPoint shape; the diagram keeps its hierarchy with a minimal visual
+  // tradeoff.
+  return stops[0]?.replace(/\s+(?:\d+(?:\.\d+)?%?|\.\d+)$/, "")
+    ?? "transparent";
+}
+
+/** Convert explicitly-authored SVG diagrams into normal positioned HTML. */
+export function materializeEditableSvgDiagrams(document: Document): number {
+  let converted = 0;
+  for (const svg of document.querySelectorAll<SVGSVGElement>(
+    ".diagram-svg > svg"
+  )) {
+    const viewBox = (svg.getAttribute("viewBox") ?? "")
+      .trim().split(/[\s,]+/).map(Number);
+    if (viewBox.length !== 4 || viewBox.some((value) => !Number.isFinite(value))) {
+      continue;
+    }
+    const minX = viewBox[0]!;
+    const minY = viewBox[1]!;
+    const width = viewBox[2]!;
+    const height = viewBox[3]!;
+    if (width <= 0 || height <= 0) continue;
+    if (svg.getAttribute("height")?.trim().toLowerCase() === "auto") {
+      svg.removeAttribute("height");
+    }
+    // Keep compact strip diagrams intact: their curved/command-relative paths
+    // carry more information than a box-and-text materialization can retain.
+    if (width / height > 4) continue;
+    const replacement = document.createElement("div");
+    replacement.className = "hs-editable-svg-diagram";
+    replacement.setAttribute("data-hs-svg-materialized", "true");
+    replacement.setAttribute(
+      "style",
+      `position:relative;width:100%;aspect-ratio:${width}/${height};overflow:visible`
+    );
+    const pctX = (value: number): number => (value - minX) / width * 100;
+    const pctY = (value: number): number => (value - minY) / height * 100;
+    const addLine = (
+      x1: number,
+      y1: number,
+      x2: number,
+      y2: number,
+      source: Element
+    ): void => {
+      const line = document.createElement("div");
+      const dx = x2 - x1;
+      const dy = y2 - y1;
+      const length = Math.sqrt(dx * dx + dy * dy);
+      const angle = Math.atan2(dy, dx) * 180 / Math.PI;
+      const stroke = svgPaint(svg, source, "stroke");
+      const strokeWidth = svgNumber(source, "stroke-width", 1);
+      line.setAttribute(
+        "style",
+        [
+          "position:absolute",
+          `left:${pctX(x1)}%`,
+          `top:${pctY(y1)}%`,
+          `width:${length / width * 100}%`,
+          `height:${strokeWidth}px`,
+          `background:${stroke}`,
+          `transform:rotate(${angle}deg)`,
+          "transform-origin:0 0",
+          `opacity:${source.getAttribute("opacity") ?? "1"}`
+        ].join(";")
+      );
+      replacement.appendChild(line);
+    };
+
+    for (const element of svg.querySelectorAll("rect, circle, line, path, text")) {
+      const tag = element.tagName.toLowerCase();
+      if (tag === "rect") {
+        const box = document.createElement("div");
+        const x = svgNumber(element, "x");
+        const y = svgNumber(element, "y");
+        const boxWidth = svgNumber(element, "width");
+        const boxHeight = svgNumber(element, "height");
+        const stroke = svgPaint(svg, element, "stroke");
+        const strokeWidth = svgNumber(element, "stroke-width");
+        box.setAttribute("style", [
+          "position:absolute",
+          `left:${pctX(x)}%`,
+          `top:${pctY(y)}%`,
+          `width:${boxWidth / width * 100}%`,
+          `height:${boxHeight / height * 100}%`,
+          `background:${svgPaint(svg, element, "fill")}`,
+          `border:${strokeWidth > 0 && stroke !== "transparent" ? `${strokeWidth}px solid ${stroke}` : "0"}`,
+          `border-radius:${svgNumber(element, "rx")}px`,
+          `opacity:${element.getAttribute("opacity") ?? "1"}`,
+          "box-sizing:border-box"
+        ].join(";"));
+        replacement.appendChild(box);
+      } else if (tag === "circle") {
+        const circle = document.createElement("div");
+        const cx = svgNumber(element, "cx");
+        const cy = svgNumber(element, "cy");
+        const radius = svgNumber(element, "r");
+        circle.setAttribute("style", [
+          "position:absolute",
+          `left:${pctX(cx - radius)}%`,
+          `top:${pctY(cy - radius)}%`,
+          `width:${radius * 2 / width * 100}%`,
+          `height:${radius * 2 / height * 100}%`,
+          `background:${svgPaint(svg, element, "fill")}`,
+          `border:${svgNumber(element, "stroke-width") || 0}px solid ${svgPaint(svg, element, "stroke")}`,
+          "border-radius:50%",
+          `opacity:${element.getAttribute("opacity") ?? "1"}`,
+          "box-sizing:border-box"
+        ].join(";"));
+        replacement.appendChild(circle);
+      } else if (tag === "line") {
+        addLine(
+          svgNumber(element, "x1"), svgNumber(element, "y1"),
+          svgNumber(element, "x2"), svgNumber(element, "y2"), element
+        );
+      } else if (tag === "path") {
+        const values = (element.getAttribute("d") ?? "")
+          .match(/-?\d*\.?\d+(?:e[-+]?\d+)?/gi)?.map(Number) ?? [];
+        for (let index = 0; index + 3 < values.length; index += 2) {
+          addLine(
+            values[index]!, values[index + 1]!,
+            values[index + 2]!, values[index + 3]!, element
+          );
+        }
+      } else if (tag === "text") {
+        const text = document.createElement("div");
+        const anchor = element.getAttribute("text-anchor") ?? "start";
+        const fontSize = svgNumber(element, "font-size", 12);
+        const letterSpacing = element.getAttribute("letter-spacing");
+        text.textContent = element.textContent ?? "";
+        text.setAttribute("style", [
+          "position:absolute",
+          `left:${pctX(svgNumber(element, "x"))}%`,
+          `top:${pctY(svgNumber(element, "y") - fontSize)}%`,
+          `transform:translateX(${anchor === "middle" ? "-50%" : anchor === "end" ? "-100%" : "0"})`,
+          `color:${svgPaint(svg, element, "fill")}`,
+          `font-size:${fontSize}px`,
+          `font-weight:${element.getAttribute("font-weight") ?? "400"}`,
+          `font-style:${element.getAttribute("font-style") ?? "normal"}`,
+          `letter-spacing:${letterSpacing === null ? "normal" : Number.isFinite(Number(letterSpacing)) ? `${letterSpacing}px` : letterSpacing}`,
+          "line-height:1.15",
+          "white-space:nowrap",
+          `opacity:${element.getAttribute("opacity") ?? "1"}`
+        ].join(";"));
+        replacement.appendChild(text);
+      }
+    }
+    svg.replaceWith(replacement);
+    converted += 1;
+  }
+  return converted;
+}
+
 function serializeDocument(document: Document): string {
   return `<!doctype html>\n${document.documentElement.outerHTML}`;
 }
@@ -185,7 +417,7 @@ export class AssetImporter {
 
   async importHtml(sourcePath: string, sourceHtml: string): Promise<ImportResult> {
     const compatibility = scanImportCompatibility(sourceHtml);
-    const { document } = parseHTML(sourceHtml);
+    const { document } = parseHTML(normalizeImportedDocumentShell(sourceHtml));
     const htmlDirectory = dirname(sourcePath);
     const baseHref = document.querySelector("base[href]")?.getAttribute("href");
     let htmlBase: string = htmlDirectory;
@@ -319,6 +551,7 @@ export class AssetImporter {
     // All references have now been resolved against the original base. Keeping
     // <base> would make the localized ../assets URLs point somewhere else.
     document.querySelectorAll("base").forEach((element) => element.remove());
+    materializeEditableSvgDiagrams(document);
 
     return {
       html: serializeDocument(document),

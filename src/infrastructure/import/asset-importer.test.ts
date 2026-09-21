@@ -2,7 +2,12 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
-import { AssetImporter } from "./asset-importer";
+import { parseHTML } from "linkedom";
+import {
+  AssetImporter,
+  materializeEditableSvgDiagrams,
+  normalizeImportedDocumentShell
+} from "./asset-importer";
 
 const temporaryDirectories: string[] = [];
 
@@ -15,6 +20,63 @@ afterEach(async () => {
 });
 
 describe("AssetImporter", () => {
+  it("materializes explicit SVG diagrams as editable text and boxes", () => {
+    const { document } = parseHTML([
+      '<html><body><div class="diagram-svg">',
+      '<svg viewBox="0 0 200 100">',
+      '<defs><linearGradient id="fade"><stop offset="0%" stop-color="#ffffff" stop-opacity="0.1"/><stop offset="100%" stop-color="#000000"/></linearGradient></defs>',
+      '<rect x="10" y="10" width="180" height="60" rx="8" fill="url(#fade)"/>',
+      '<text x="100" y="45" text-anchor="middle" letter-spacing="2" fill="#123">AI 能力引擎</text>',
+      '<line x1="20" y1="80" x2="180" y2="80" stroke="#456"/>',
+      '</svg></div></body></html>'
+    ].join(""));
+
+    expect(materializeEditableSvgDiagrams(document)).toBe(1);
+    expect(document.querySelector("svg")).toBeNull();
+    const diagram = document.querySelector("[data-hs-svg-materialized]");
+    expect(diagram?.textContent).toContain("AI 能力引擎");
+    expect(diagram?.querySelectorAll("div").length).toBe(3);
+    expect(diagram?.innerHTML).toContain("rgba(255, 255, 255, 0.1)");
+    expect(diagram?.innerHTML).toContain("letter-spacing:2px");
+  });
+
+  it("leaves compact strip diagrams intact and removes an invalid auto height", () => {
+    const { document } = parseHTML(
+      '<html><body><div class="diagram-svg"><svg viewBox="0 0 840 110" height="auto"><path d="M0 0 Q 20 20 40 0"/></svg></div></body></html>'
+    );
+
+    expect(materializeEditableSvgDiagrams(document)).toBe(0);
+    expect(document.querySelector("svg")).not.toBeNull();
+    expect(document.querySelector("svg")?.hasAttribute("height")).toBe(false);
+  });
+
+  it("repairs a missing html/head opening shell without dropping the body", async () => {
+    const sourceRoot = await mkdtemp(join(tmpdir(), "html-studio-source-"));
+    const projectRoot = await mkdtemp(join(tmpdir(), "html-studio-project-"));
+    temporaryDirectories.push(sourceRoot, projectRoot);
+    const sourcePath = join(sourceRoot, "broken-shell.html");
+    const html = [
+      "<title>品牌感受力</title>",
+      "<style>body{color:#123456}</style>",
+      "</head>",
+      '<body><main id="content">完整正文</main></body>',
+      "</html>"
+    ].join("\n");
+
+    const normalized = normalizeImportedDocumentShell(html);
+    expect(normalized).toContain("<html><head>");
+    expect(normalized).toContain('<body><main id="content">');
+
+    const result = await new AssetImporter(projectRoot).importHtml(
+      sourcePath,
+      html
+    );
+    expect(result.html).toContain("<html><head>");
+    expect(result.html).toContain("<title>品牌感受力</title>");
+    expect(result.html).toContain('<main id="content">完整正文</main>');
+    expect(result.html.length).toBeGreaterThan(100);
+  });
+
   it("preserves known remote styles for the bundled runtime mapper", async () => {
     const sourceRoot = await mkdtemp(join(tmpdir(), "html-studio-source-"));
     const projectRoot = await mkdtemp(join(tmpdir(), "html-studio-project-"));

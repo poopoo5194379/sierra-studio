@@ -117,7 +117,7 @@ export function createEditorDocumentResponse(
     "media-src htmlstudio-project: data: blob:",
     "connect-src 'none'",
     "worker-src 'none'",
-    "frame-src 'none'",
+    "frame-src data:",
     "object-src 'none'",
     "base-uri 'none'",
     "form-action 'none'"
@@ -174,7 +174,7 @@ export function createPdfDocumentResponse(
     "media-src htmlstudio-project: data: blob:",
     "connect-src 'none'",
     "worker-src 'none'",
-    "frame-src 'none'",
+    "frame-src data:",
     "object-src 'none'",
     "base-uri 'none'",
     "form-action 'none'"

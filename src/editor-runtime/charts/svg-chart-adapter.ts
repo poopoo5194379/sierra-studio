@@ -630,7 +630,7 @@ function descriptorOf(svg: SVGSVGElement): string {
 
 function looksLikeChart(svg: SVGSVGElement): boolean {
   if (svg.closest("[_echarts_instance_], [data-hs-chart]")) return false;
-  if (/logo|icon|avatar|badge|illustration|decoration/i.test(descriptorOf(svg))) {
+  if (/logo|icon|avatar|badge|illustration|decoration|diagram/i.test(descriptorOf(svg))) {
     return false;
   }
   const rect = svg.getBoundingClientRect();

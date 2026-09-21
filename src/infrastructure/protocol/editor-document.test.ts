@@ -9,6 +9,24 @@ import {
 } from "../../domain/watermarks/watermark-model";
 
 describe("createEditorDocumentResponse", () => {
+  it("renders self-contained HTML embeds without allowing remote frame navigation", async () => {
+    const embedded = '<html><body><button onclick="this.textContent=\'完成\'">项目</button></body></html>';
+    const source = '<html><head></head><body><iframe title="DEMO" src="data:text/html;charset=utf-8;base64,'
+      + Buffer.from(embedded).toString("base64")
+      + '"></iframe><iframe src="https://example.com/"></iframe></body></html>';
+    for (const response of [createEditorDocumentResponse(source), createPdfDocumentResponse(source)]) {
+      const html = await response.text();
+      const { document } = (await import("linkedom")).parseHTML(html);
+      const frames = document.querySelectorAll("iframe");
+      expect(frames[0]!.getAttribute("src")).toBe("data:text/html;charset=utf-8;base64," + Buffer.from(embedded).toString("base64"));
+      expect(frames[0]!.hasAttribute("srcdoc")).toBe(false);
+      expect(frames[0]!.getAttribute("title")).toBe("DEMO");
+      expect(frames[1]!.getAttribute("src")).toBe("https://example.com/");
+      expect(html).toContain("frame-src data:");
+      expect(html).toContain("connect-src 'none'");
+    }
+  });
+
   it("injects the isolated runtime and blocks network access", async () => {
     const response = createEditorDocumentResponse(
       '<!doctype html><html><head><script>const x = "</body>"</script></head>'

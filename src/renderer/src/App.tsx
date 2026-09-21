@@ -25,10 +25,13 @@ import {
   Layers3,
   Link2,
   Maximize2,
+  Minimize2,
   Minus,
   Monitor,
   Move,
   PanelLeft,
+  PanelLeftClose,
+  PanelRightClose,
   Palette,
   Paintbrush,
   Plus,
@@ -452,6 +455,9 @@ export function App(): React.JSX.Element {
   const [cloudSaveStatus, setCloudSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [updateStatus, setUpdateStatus] = useState<"checking" | "available" | "latest" | "downloading" | "downloaded" | null>(null);
   const [showCloudPanel, setShowCloudPanel] = useState(false);
+  const [leftToolsHidden, setLeftToolsHidden] = useState(false);
+  const [rightToolsHidden, setRightToolsHidden] = useState(false);
+  const canvasFullscreen = leftToolsHidden && rightToolsHidden;
 
   useEffect(() => window.sierraStudio.onOperationProgress((event) => {
     setOperationLabel(event.active ? event.label ?? "正在处理…" : null);
@@ -1341,12 +1347,26 @@ export function App(): React.JSX.Element {
     postToEditor({ action: "locate-node", nodeId });
   };
 
-  const changeViewport = (width: number, height: number): void => {
-    if (!Number.isFinite(width) || !Number.isFinite(height)) return;
-    setCanvasViewport({
-      width: Math.min(7680, Math.max(240, width)),
-      height: Math.min(7680, Math.max(240, height))
-    });
+  const changeCanvasWidth = (width: number): void => {
+    if (!Number.isFinite(width)) return;
+    setCanvasViewport((current) => ({
+      ...current,
+      width: Math.min(7680, Math.max(240, Math.round(width)))
+    }));
+  };
+
+  const changeCanvasHeight = (height: number): void => {
+    if (!Number.isFinite(height)) return;
+    setCanvasViewport((current) => ({
+      ...current,
+      height: Math.min(7680, Math.max(240, Math.round(height)))
+    }));
+  };
+
+  const toggleCanvasFullscreen = (): void => {
+    const hidden = !canvasFullscreen;
+    setLeftToolsHidden(hidden);
+    setRightToolsHidden(hidden);
   };
 
   const selectBreakpoint = (breakpoint: BreakpointDefinition): void => {
@@ -1540,7 +1560,7 @@ export function App(): React.JSX.Element {
 
         <div className="toolbar">
           <button className="toolbar-button subtle" onClick={importHtml} disabled={busy}>
-            <FolderOpen size={15} />打开
+            <FolderOpen size={15} />打开文件
           </button>
           <button
             className="toolbar-button subtle"
@@ -1595,7 +1615,7 @@ export function App(): React.JSX.Element {
         </div>
       )}
 
-      <section className="workspace">
+      <section className={`workspace${leftToolsHidden ? " left-tools-hidden" : ""}${rightToolsHidden ? " right-tools-hidden" : ""}`}>
         <nav className="activity-rail" aria-label="编辑器面板">
           {[
             { id: "layers", label: "图层", icon: Layers3 },
@@ -1888,7 +1908,8 @@ export function App(): React.JSX.Element {
                 viewport={canvasViewport}
                 auditBusy={responsiveAuditBusy}
                 onSelect={selectBreakpoint}
-                onViewportChange={changeViewport}
+                onCanvasWidthChange={changeCanvasWidth}
+                onCanvasHeightChange={changeCanvasHeight}
                 onRotate={() => setCanvasViewport((current) => ({
                   width: current.height,
                   height: current.width
@@ -1903,6 +1924,32 @@ export function App(): React.JSX.Element {
                 <span>{selection.count > 1 ? `${selection.count} 个元素` : selection.isComponent ? "卡片组件" : selection.tagName}</span>
               </div>
             )}
+            <div className="canvas-view-controls" role="group" aria-label="画布视图">
+              <button
+                className={`canvas-tool-button${leftToolsHidden ? " active" : ""}`}
+                onClick={() => setLeftToolsHidden((hidden) => !hidden)}
+                title={leftToolsHidden ? "显示左侧工具栏" : "隐藏左侧工具栏"}
+                aria-label={leftToolsHidden ? "显示左侧工具栏" : "隐藏左侧工具栏"}
+              >
+                <PanelLeftClose size={14} />
+              </button>
+              <button
+                className={`canvas-tool-button${rightToolsHidden ? " active" : ""}`}
+                onClick={() => setRightToolsHidden((hidden) => !hidden)}
+                title={rightToolsHidden ? "显示右侧工具栏" : "隐藏右侧工具栏"}
+                aria-label={rightToolsHidden ? "显示右侧工具栏" : "隐藏右侧工具栏"}
+              >
+                <PanelRightClose size={14} />
+              </button>
+              <button
+                className={`canvas-tool-button${canvasFullscreen ? " active" : ""}`}
+                onClick={toggleCanvasFullscreen}
+                title={canvasFullscreen ? "恢复左右工具栏" : "全屏画布（隐藏左右工具栏）"}
+                aria-label={canvasFullscreen ? "退出全屏画布" : "全屏画布"}
+              >
+                {canvasFullscreen ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+              </button>
+            </div>
           </div>
           <section className="canvas-area">
             {project ? (
@@ -1910,8 +1957,10 @@ export function App(): React.JSX.Element {
                 documentUrl={project.documentUrl}
                 projectId={project.projectId}
                 reloadKey={reloadKey}
-                viewportWidth={canvasViewport.width}
-                viewportHeight={canvasViewport.height}
+                viewportWidth={activeBreakpoint?.width ?? canvasViewport.width}
+                canvasWidth={canvasViewport.width}
+                canvasHeight={canvasViewport.height}
+                allowUpscale={leftToolsHidden || rightToolsHidden}
                 iframeRef={iframeRef}
                 runtimeState={runtimeState}
                 onReload={reloadAuthoritativeDocument}

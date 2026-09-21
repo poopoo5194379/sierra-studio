@@ -1213,6 +1213,24 @@ button.primary:hover:not(:disabled) {
   background: var(--bg-app);
 }
 
+.workspace.left-tools-hidden {
+  grid-template-columns: minmax(320px, 1fr) 292px;
+}
+
+.workspace.left-tools-hidden .activity-rail,
+.workspace.left-tools-hidden .left-panel,
+.workspace.right-tools-hidden .right-panel {
+  display: none;
+}
+
+.workspace.right-tools-hidden {
+  grid-template-columns: 52px 244px minmax(320px, 1fr);
+}
+
+.workspace.left-tools-hidden.right-tools-hidden {
+  grid-template-columns: minmax(320px, 1fr);
+}
+
 .activity-rail {
   display: flex;
   flex-direction: column;
@@ -1624,6 +1642,25 @@ button.primary:hover:not(:disabled) {
   color: var(--text);
   border-color: #475068;
   background: var(--bg-hover);
+}
+
+.canvas-tool-button.active {
+  color: #dfe2ff;
+  border-color: #6672b055;
+  background: var(--accent-soft);
+}
+
+.canvas-view-controls {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding-left: 4px;
+  border-left: 1px solid var(--line);
+}
+
+.canvas-view-controls .canvas-tool-button {
+  width: 27px;
+  padding: 0;
 }
 
 .breakpoint-inspector {
@@ -2330,6 +2367,11 @@ button.primary:hover:not(:disabled) {
 
 .canvas-frame {
   border-radius: 3px;
+  box-shadow: 0 18px 60px #0009, 0 0 0 1px #ffffff0d;
+}
+
+.canvas-scale-stage {
+  background: #0f1115;
   box-shadow: 0 18px 60px #0009, 0 0 0 1px #ffffff0d;
 }
 

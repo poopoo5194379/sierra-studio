@@ -174,15 +174,55 @@ for (const font of fontSources) {
     fontCss.push(css);
   }
 }
-const alibabaFontSource = path.join(
-  process.env.LOCALAPPDATA || "",
-  "Microsoft",
-  "Windows",
-  "Fonts",
-  "AlibabaPuHuiTi-3-95-ExtraBold.ttf"
+// Alibaba PuHuiTi ExtraBold is required at build time. Resolve it cross-platform:
+// 1. an explicit override via env var (handy in CI / on macOS),
+// 2. the copy vendored inside this repo (build/fonts), so any clone can build,
+// 3. the host system font directory (Windows: per-user + machine-wide, macOS: ~/Library/Fonts + /Library/Fonts).
+const ALIBABA_FONT_FILE = "AlibabaPuHuiTi-3-95-ExtraBold.ttf";
+const alibabaFontCandidates = [
+  process.env.SIERRA_ALIBABA_FONT || "",
+  path.join(root, "build", "fonts", ALIBABA_FONT_FILE),
+  path.join(root, "assets", "fonts", ALIBABA_FONT_FILE),
+  ...(process.platform === "win32"
+    ? [
+        path.join(
+          process.env.LOCALAPPDATA || "",
+          "Microsoft",
+          "Windows",
+          "Fonts",
+          ALIBABA_FONT_FILE
+        ),
+        path.join(process.env.WINDIR || "C:\\Windows", "Fonts", ALIBABA_FONT_FILE),
+        path.join(process.env.APPDATA || "", "Microsoft", "Windows", "Fonts", ALIBABA_FONT_FILE)
+      ]
+    : []),
+  ...(process.platform === "darwin"
+    ? [
+        path.join(process.env.HOME || "", "Library", "Fonts", ALIBABA_FONT_FILE),
+        path.join("/Library", "Fonts", ALIBABA_FONT_FILE),
+        path.join("/System", "Library", "Fonts", ALIBABA_FONT_FILE)
+      ]
+    : []),
+  ...(process.platform === "linux"
+    ? [
+        path.join(process.env.HOME || "", ".local", "share", "fonts", ALIBABA_FONT_FILE),
+        path.join(process.env.HOME || "", ".fonts", ALIBABA_FONT_FILE),
+        path.join("/usr", "share", "fonts", ALIBABA_FONT_FILE)
+      ]
+    : [])
+].filter(Boolean);
+
+const alibabaFontSource = alibabaFontCandidates.find((candidate) =>
+  fs.existsSync(candidate)
 );
-if (!fs.existsSync(alibabaFontSource)) {
-  throw new Error(`Missing required Alibaba PuHuiTi ExtraBold font: ${alibabaFontSource}`);
+if (!alibabaFontSource) {
+  throw new Error(
+    "Missing required Alibaba PuHuiTi ExtraBold font.\n"
+    + `Looked in:\n${alibabaFontCandidates.map((c) => `  - ${c}`).join("\n")}\n`
+    + "Fix: put the file at build/fonts/"
+    + ALIBABA_FONT_FILE
+    + " (recommended for reproducible builds), or set SIERRA_ALIBABA_FONT=/abs/path/to/font.ttf."
+  );
 }
 const alibabaFontDirectory = path.join(
   outputDirectory,

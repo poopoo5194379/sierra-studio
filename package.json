@@ -1,7 +1,7 @@
 {
   "name": "sierra-studio",
   "productName": "SierraStudio",
-  "version": "0.3.11",
+  "version": "0.3.13",
   "private": true,
   "description": "SierraStudio - a local-first visual HTML editor and PDF export studio.",
   "main": "./out/main/index.js",

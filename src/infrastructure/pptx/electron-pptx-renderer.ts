@@ -20,6 +20,7 @@ import {
 } from "./native-chart-export";
 import { mergeEditablePptxChunks } from "./editable-pptx-chunks";
 import { ensurePowerPointEastAsianFont } from "./pptx-font-normalization";
+import { normalizeTableCellMargins } from "./pptx-table-normalization";
 
 interface PreparedSlides {
   slides: number;
@@ -42,10 +43,12 @@ interface RiskyVisualTarget extends CaptureTarget {
 
 interface EditableTableMetric {
   rowHeights: number[];
+  cellMargins: number[][];
 }
 
 interface EditableSlideMetric {
   tables: EditableTableMetric[];
+  fontScale: number;
 }
 
 const require = createRequire(import.meta.url);
@@ -55,7 +58,12 @@ const EDITABLE_EXPORT_CHUNK_SIZE = 8;
 // created a visible white frame around every page and made a slide root look
 // like an inset card in PowerPoint.
 const EDITABLE_SAFE_SCALE = 1;
-const ALIBABA_EXTRA_BOLD_FAMILY = "Alibaba PuHuiTi 3.0";
+// Strict px-to-pt conversion is geometrically correct but looks slightly
+// undersized in Office for fixed 1920 x 1080 Chinese presentation canvases.
+// Keep this a small optical correction; the previous wrapper-scale bug was
+// roughly 1.4x and must not be reintroduced.
+const FIXED_CANVAS_FONT_SCALE = 1.05;
+const POWERPOINT_FALLBACK_FAMILY = "Microsoft YaHei";
 
 const ENGLISH_GOOGLE_FONT_FAMILIES = [
   "barlow condensed",
@@ -74,7 +82,11 @@ const ENGLISH_GOOGLE_FONT_FAMILIES = [
   "roboto",
   "roboto mono",
   "source code pro",
-  "source sans 3"
+  "source sans 3",
+  "sora",
+  "jetbrains mono",
+  "noto sans sc",
+  "noto serif sc"
 ];
 
 const POWERPOINT_FONT_ALIASES: Record<string, { latin: string; eastAsian: string }> = {
@@ -82,14 +94,14 @@ const POWERPOINT_FONT_ALIASES: Record<string, { latin: string; eastAsian: string
   "blinkmacsystemfont": { latin: "Segoe UI", eastAsian: "Microsoft YaHei" },
   "system-ui": { latin: "Segoe UI", eastAsian: "Microsoft YaHei" },
   "segoe print": {
-    latin: ALIBABA_EXTRA_BOLD_FAMILY,
-    eastAsian: ALIBABA_EXTRA_BOLD_FAMILY
+    latin: POWERPOINT_FALLBACK_FAMILY,
+    eastAsian: POWERPOINT_FALLBACK_FAMILY
   },
   ...Object.fromEntries(ENGLISH_GOOGLE_FONT_FAMILIES.map((family) => [
     family,
     {
-      latin: ALIBABA_EXTRA_BOLD_FAMILY,
-      eastAsian: ALIBABA_EXTRA_BOLD_FAMILY
+      latin: POWERPOINT_FALLBACK_FAMILY,
+      eastAsian: POWERPOINT_FALLBACK_FAMILY
     }
   ]))
 };
@@ -125,7 +137,9 @@ function addSingleLineTextSafety(xml: string): string {
       ...Array.from(shape.matchAll(/\bsz="(\d+)"/g))
         .map((match) => Number(match[1]))
     );
-    const largeDisplayText = largestFontSize >= 4800
+    // A 54px heading on a 1920px canvas becomes ~27pt on a 13.33in
+    // slide. Judge the exported size, not the original CSS pixel size.
+    const largeDisplayText = largestFontSize >= 2400
       && plainText.length > 0
       && plainText.length <= 18;
     const isCompactSingleLine = height > 0
@@ -187,6 +201,8 @@ interface BackgroundCaptureClip extends Electron.Rectangle {
 interface MaterializedPresentationState {
   animatedElements: number;
   formControls: number;
+  mergedInlineTextRows: number;
+  normalizedTextFragments: number;
   mappedFontElements: number;
   normalizedPseudoCircles: number;
   suppressedDuplicateTitles: number;
@@ -207,16 +223,28 @@ async function materializePresentationState(
     ].join(",");
     let animatedElements = 0;
     let formControls = 0;
+    let mergedInlineTextRows = 0;
+    let normalizedTextFragments = 0;
     let mappedFontElements = 0;
     let normalizedPseudoCircles = 0;
     let suppressedDuplicateTitles = 0;
     let normalizedNegativeTracking = 0;
-    const replacementFont = ${JSON.stringify(ALIBABA_EXTRA_BOLD_FAMILY)};
+    const replacementFont = ${JSON.stringify(POWERPOINT_FALLBACK_FAMILY)};
     const mappedFontFamilies = new Set(${JSON.stringify([
       "segoe print",
       ...ENGLISH_GOOGLE_FONT_FAMILIES
     ])});
     const pseudoCircleRules = [];
+
+    const inlineTextStyle = document.createElement("style");
+    inlineTextStyle.setAttribute("data-sierra-pptx-inline-text-fixes", "true");
+    inlineTextStyle.textContent = [
+      '[data-sierra-pptx-inline-row]::before { content:none!important; display:none!important; }',
+      '[data-sierra-pptx-inline-row]::after { content:none!important; display:none!important; }',
+      '[data-sierra-pptx-suppress-quotes]::before { content:none!important; }',
+      '[data-sierra-pptx-suppress-quotes]::after { content:none!important; }'
+    ].join("\\n");
+    document.head.appendChild(inlineTextStyle);
 
     const copyComputedStyle = (from, to) => {
       const style = getComputedStyle(from);
@@ -237,6 +265,137 @@ async function materializePresentationState(
       root.classList.add("active", "visible", "show", "shown", "is-active");
       root.removeAttribute("hidden");
       root.setAttribute("aria-hidden", "false");
+
+      // dom-to-pptx intentionally rejects inline children when their parent
+      // is flex/grid, then exports each text node at a fixed coordinate. In
+      // PowerPoint those fragments wrap independently and overlap. Convert
+      // only simple, text-only horizontal flex rows into one block container;
+      // inline descendants remain rich-text runs and stay fully editable.
+      root.querySelectorAll("*").forEach((element) => {
+        if (!(element instanceof HTMLElement)) return;
+        const style = getComputedStyle(element);
+        if (
+          !["flex", "inline-flex"].includes(style.display)
+          || !String(style.flexDirection || "row").startsWith("row")
+          || !["normal", "flex-start", "start"].includes(style.justifyContent)
+        ) return;
+        const children = Array.from(element.children);
+        if (children.length === 0 || children.length > 6) return;
+        const simpleInlineTags = new Set([
+          "A", "B", "EM", "I", "MARK", "Q", "SMALL", "SPAN", "STRONG"
+        ]);
+        const simpleTextOnly = children.every((child) =>
+          child instanceof HTMLElement
+          && simpleInlineTags.has(child.tagName)
+          && !!String(child.textContent || "").trim()
+          && !child.querySelector("img,svg,canvas,video,table")
+        );
+        if (!simpleTextOnly) return;
+        const hasDirectText = Array.from(element.childNodes).some((node) =>
+          node.nodeType === Node.TEXT_NODE
+          && !!String(node.nodeValue || "").trim()
+        );
+        if (!hasDirectText && children.length < 2) return;
+
+        const beforeStyle = getComputedStyle(element, "::before");
+        const beforeContent = String(beforeStyle.content || "");
+        const beforeWidth = Number.parseFloat(beforeStyle.width || "0");
+        const beforeHeight = Number.parseFloat(beforeStyle.height || "0");
+        const beforeColor = String(beforeStyle.backgroundColor || "");
+        const visualEmptyBullet = (beforeContent === '""' || beforeContent === "''")
+          && beforeWidth >= 3
+          && beforeHeight >= 3
+          && beforeColor !== "transparent"
+          && beforeColor !== "rgba(0, 0, 0, 0)";
+        if (visualEmptyBullet) {
+          const bullet = document.createElement("span");
+          bullet.textContent = "• ";
+          bullet.style.setProperty("display", "inline", "important");
+          bullet.style.setProperty("color", beforeColor, "important");
+          element.insertBefore(bullet, element.firstChild);
+        }
+
+        const inlineChildren = Array.from(element.children);
+        inlineChildren.forEach((child, index) => {
+          child.style.setProperty("display", "inline", "important");
+          if (
+            index < inlineChildren.length - 1
+            && !String(child.textContent || "").endsWith(" ")
+            && !String(child.textContent || "").endsWith("\u00a0")
+          ) {
+            child.appendChild(document.createTextNode("\u00a0"));
+          }
+        });
+        element.setAttribute("data-sierra-pptx-inline-row", "");
+        element.style.setProperty("display", "block", "important");
+        element.style.setProperty("column-gap", "0", "important");
+        element.style.setProperty("row-gap", "0", "important");
+        mergedInlineTextRows += 1;
+      });
+
+      root.querySelectorAll("q").forEach((quote) => {
+        const before = String(getComputedStyle(quote, "::before").content || "")
+          .replace(/^['\"]|['\"]$/g, "");
+        const after = String(getComputedStyle(quote, "::after").content || "")
+          .replace(/^['\"]|['\"]$/g, "");
+        if (before === "open-quote" || after === "close-quote") {
+          quote.setAttribute("data-sierra-pptx-suppress-quotes", "");
+        }
+      });
+
+      // A block label followed by a naked text node (for example
+      // <h3><span>01</span>Title</h3>) is otherwise exported using only the
+      // glyph range width. Office font metrics are slightly wider, so that
+      // exact-width box wraps even though the browser kept the title on one
+      // line. Give the fragment its parent's usable width while retaining it
+      // as a normal editable text shape.
+      root.querySelectorAll("*").forEach((element) => {
+        if (!(element instanceof HTMLElement)) return;
+        const hasBlockChild = Array.from(element.children).some((child) =>
+          ["block", "flex", "grid", "table"].includes(
+            getComputedStyle(child).display
+          )
+        );
+        if (!hasBlockChild) return;
+        const textNodes = Array.from(element.childNodes).filter((node) =>
+          node.nodeType === Node.TEXT_NODE
+          && !!String(node.nodeValue || "").trim()
+        );
+        textNodes.forEach((textNode) => {
+          const range = document.createRange();
+          range.selectNode(textNode);
+          const rects = Array.from(range.getClientRects()).filter((rect) =>
+            rect.width > 0.5 && rect.height > 0.5
+          );
+          range.detach();
+          const lineTops = [];
+          rects.forEach((rect) => {
+            if (!lineTops.some((top) => Math.abs(top - rect.top) <= 2)) {
+              lineTops.push(rect.top);
+            }
+          });
+          const wrapper = document.createElement("span");
+          wrapper.textContent = textNode.nodeValue;
+          const parentTextStyle = getComputedStyle(element);
+          wrapper.style.setProperty("display", "block", "important");
+          wrapper.style.setProperty("width", "100%", "important");
+          wrapper.style.setProperty("max-width", "100%", "important");
+          [
+            "color", "font-family", "font-size", "font-style",
+            "font-weight", "letter-spacing", "line-height", "text-align"
+          ].forEach((property) => wrapper.style.setProperty(
+            property,
+            parentTextStyle.getPropertyValue(property),
+            "important"
+          ));
+          if (lineTops.length <= 1) {
+            wrapper.style.setProperty("white-space", "nowrap", "important");
+          }
+          textNode.replaceWith(wrapper);
+          normalizedTextFragments += 1;
+        });
+      });
+
       root.querySelectorAll(animatedSelector).forEach((element) => {
         if (!(element instanceof HTMLElement || element instanceof SVGElement)) {
           return;
@@ -299,10 +458,7 @@ async function materializePresentationState(
             '"' + replacementFont + '", "Microsoft YaHei", sans-serif',
             "important"
           );
-          // PowerPoint reads the ExtraBold TTF's advance widths incorrectly
-          // on some Office builds. Use Alibaba's stable regular face and let
-          // Office apply the requested ExtraBold appearance.
-          element.style.setProperty("font-weight", "800", "important");
+          // Preserve the authored weight while measuring the Office font.
           element.style.setProperty("letter-spacing", "0", "important");
           mappedFontElements += 1;
         }
@@ -385,7 +541,7 @@ async function materializePresentationState(
       // The OOXML alias pass below still guarantees the requested font name.
     }
 
-    // The requested Alibaba face is wider than several condensed Google
+    // The Office fallback face is wider than several condensed Google
     // display fonts. Keep short display metrics inside their original grid
     // cell by reducing only the overflowing element's font size.
     roots.forEach((root) => {
@@ -443,6 +599,8 @@ async function materializePresentationState(
     return {
       animatedElements,
       formControls,
+      mergedInlineTextRows,
+      normalizedTextFragments,
       mappedFontElements,
       normalizedPseudoCircles,
       suppressedDuplicateTitles,
@@ -822,7 +980,15 @@ async function rasterizeRiskyVisualRegions(
         const style = getComputedStyle(element);
         const background = String(style.backgroundImage || "").toLowerCase();
         const gradientCount = background.split("gradient(").length - 1;
+        // dom-to-pptx parses a layered gradient(...), url(...) background as
+        // one gradient and can feed the image URL into an SVG stop-color. That
+        // produces an invalid SVG and aborts both hybrid and editable exports.
+        // Rasterize this unavoidable converter edge case in either mode while
+        // keeping the rest of the slide editable.
+        const mixesGradientAndImage = gradientCount > 0
+          && background.includes("url(");
         const riskyBackground = background.includes("conic-gradient(")
+          || mixesGradientAndImage
           || (!conicOnly && (
             background.includes("repeating-linear-gradient(")
             || background.includes("repeating-radial-gradient(")
@@ -1160,9 +1326,25 @@ async function normalizeEditablePptx(
           (_match, name: string, value: string) =>
             `${name}="${Math.max(0, Math.round(Number(value) * marginScale))}"`
         );
+        // The converter mixes inches and points for CSS cell padding (in
+        // particular zero padding). Use measured padding, not its OOXML.
+        updated = normalizeTableCellMargins(updated, tableMetric.cellMargins);
         return updated;
       }
     );
+    const fontScale = slideMetric?.fontScale ?? 1;
+    if (fontScale !== 1) {
+      xml = xml.replace(
+        /\bsz="(\d+)"/g,
+        (_match, value: string) =>
+          `sz="${Math.max(100, Math.round(Number(value) * fontScale))}"`
+      );
+      xml = xml.replace(
+        /(<a:spcPts\s+val=")(\d+)("\s*\/>)/g,
+        (_match, before: string, value: string, after: string) =>
+          `${before}${Math.max(100, Math.round(Number(value) * fontScale))}${after}`
+      );
+    }
     if (slideWidth > 0 && slideHeight > 0) {
       xml = scaleTopLevelObjects(xml, slideWidth, slideHeight);
       xml = expandRootBackground(xml, slideWidth, slideHeight);
@@ -1257,9 +1439,19 @@ export class ElectronPptxRenderer implements PptxRenderer {
           `${materialized.formControls} 个表单控件已转换为可编辑的静态文本/符号。`
         );
       }
+      if (materialized.mergedInlineTextRows > 0) {
+        warnings.push(
+          `${materialized.mergedInlineTextRows} 个横向富文本行已合并为单一可编辑文本框，避免片段换行重叠。`
+        );
+      }
+      if (materialized.normalizedTextFragments > 0) {
+        warnings.push(
+          `${materialized.normalizedTextFragments} 个块级标签后的文本片段已按容器宽度输出，避免 Office 字体度量导致意外换行。`
+        );
+      }
       if (materialized.mappedFontElements > 0) {
         warnings.push(
-          `${materialized.mappedFontElements} 个 Segoe Print / Google 英文字体对象已映射为阿里巴巴普惠体 ExtraBold。`
+          `${materialized.mappedFontElements} 个 Segoe Print / Google 字体对象已映射为微软雅黑，保留原始字重。`
         );
       }
       if (materialized.normalizedPseudoCircles > 0) {
@@ -1338,6 +1530,7 @@ export class ElectronPptxRenderer implements PptxRenderer {
         ".slides > section",
         ".slide",
         "[data-slide]",
+        ".viewport > .stage",
         ".page"
       ];
       let candidates = [];
@@ -1347,7 +1540,28 @@ export class ElectronPptxRenderer implements PptxRenderer {
       for (const selector of explicitSelectors) {
         const matches = uniqueTopLevel(
           Array.from(document.querySelectorAll(selector))
-        ).filter((element) => !element.matches("script, style, link"));
+        ).filter((element) => {
+          if (element.matches("script, style, link")) return false;
+          if (selector !== ".page") return true;
+
+          // ".page" is also a common class name for a small page-number label.
+          // Keep text-only slide canvases, but reject leaf labels that are far
+          // too small to represent a slide.
+          const style = getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          const width = Math.max(
+            element.offsetWidth,
+            parseFloat(style.width) || 0,
+            rect.width
+          );
+          const height = Math.max(
+            element.offsetHeight,
+            parseFloat(style.height) || 0,
+            rect.height
+          );
+          return element.childElementCount > 0
+            || (width >= 320 && height >= 180);
+        });
         if (matches.length > 0) {
           candidates = matches;
           break;
@@ -1470,6 +1684,31 @@ export class ElectronPptxRenderer implements PptxRenderer {
       const logicalSizes = candidates.map((element) => {
         const style = getComputedStyle(element);
         const rect = element.getBoundingClientRect();
+        // Fixed-canvas decks commonly use a fitted wrapper such as
+        // .page > .stage: the wrapper is resized to the current browser
+        // viewport while the authored stage keeps its 1920 x 1080 geometry
+        // and is visually scaled with transform. Exporting the fitted wrapper
+        // makes dom-to-pptx lay out fixed-pixel text against the smaller box,
+        // so PowerPoint receives oversized type and overlapping objects.
+        // Measure the authored canvas instead and neutralize only that fit
+        // transform below; ordinary responsive pages keep the old path.
+        const fixedStage = element.querySelector(":scope > .stage");
+        const fixedStageStyle = fixedStage
+          ? getComputedStyle(fixedStage)
+          : null;
+        const fixedStageWidth = fixedStage
+          ? fixedStage.offsetWidth || parseFloat(fixedStageStyle?.width || "0")
+          : 0;
+        const fixedStageHeight = fixedStage
+          ? fixedStage.offsetHeight || parseFloat(fixedStageStyle?.height || "0")
+          : 0;
+        if (fixedStageWidth >= 120 && fixedStageHeight >= 80) {
+          return {
+            width: fixedStageWidth,
+            height: fixedStageHeight,
+            fixedStage
+          };
+        }
         return {
           width: Math.max(
             1,
@@ -1478,13 +1717,22 @@ export class ElectronPptxRenderer implements PptxRenderer {
           height: Math.max(
             1,
             element.offsetHeight || parseFloat(style.height) || rect.height
-          )
+          ),
+          fixedStage: null
         };
       });
       const maxSlideWidth = Math.max(...logicalSizes.map((size) => size.width));
       const maxSlideHeight = Math.max(...logicalSizes.map((size) => size.height));
       candidates.forEach((element, index) => {
         const logicalSize = logicalSizes[index];
+        if (logicalSize.fixedStage) {
+          logicalSize.fixedStage.style.setProperty(
+            "transform", "none", "important"
+          );
+          logicalSize.fixedStage.style.setProperty(
+            "transform-origin", "0 0", "important"
+          );
+        }
         element.setAttribute("data-sierra-pptx-slide", String(index));
         const style = getComputedStyle(element);
         if (
@@ -1709,6 +1957,16 @@ export class ElectronPptxRenderer implements PptxRenderer {
               && style.visibility !== "hidden";
           })
           .map((table) => ({
+            cellMargins: Array.from(table.rows).flatMap((row) =>
+              Array.from(row.cells).map((cell) => {
+                const style = getComputedStyle(cell);
+                return ["paddingLeft", "paddingRight", "paddingTop", "paddingBottom"]
+                  .map((property) => Math.max(0, Math.round(
+                    (Number.parseFloat(style[property]) || 0)
+                    * PX_TO_INCH * scale * EMU_PER_INCH
+                  )));
+              })
+            ),
             rowHeights: Array.from(table.rows).map((row) =>
               Math.max(
                 1,
@@ -1721,7 +1979,11 @@ export class ElectronPptxRenderer implements PptxRenderer {
               )
             )
           }));
-        return { tables };
+        const fixedCanvas = !!root.querySelector(":scope > .stage");
+        return {
+          tables,
+          fontScale: fixedCanvas ? ${FIXED_CANVAS_FONT_SCALE} : 1
+        };
       });
     })()`, true) as EditableSlideMetric[];
     const nativeCharts = await window.webContents.executeJavaScript(
